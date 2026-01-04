@@ -45,6 +45,14 @@ async function postToBase44(url, payload) {
 }
 
 // ===== MAIN ENDPOINT =====
+app.get("/", (req, res) => {
+  res.status(200).send("TrendForge Trend Service is running ✅");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, service: "trendforge-trend-service" });
+});
+
 app.post("/scan", requireAuth, async (req, res) => {
   const { nicheName, platforms } = req.body || {};
   const p = Array.isArray(platforms) ? platforms : ["reddit"];
@@ -71,6 +79,8 @@ app.post("/scan", requireAuth, async (req, res) => {
 
 
 // ===== START SERVER =====
-app.listen(3000, () => {
-  console.log("TrendForge Trend Service running on http://localhost:3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
