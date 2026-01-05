@@ -9,6 +9,10 @@ app.use(express.json());
 
 // ===== CONFIG =====
 // Must match what Base44 will send
+if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
+if (!process.env.BASE44_ERROR_URL) console.warn("⚠️ BASE44_ERROR_URL is missing");
+if (!process.env.INGEST_SECRET) console.warn("⚠️ INGEST_SECRET is missing");
+
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "trendforge_service_token";
 
 // Must match your Base44 ingestTrendResults secret
