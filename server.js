@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { createClient } from "@base44/sdk";
 
 const app = express();
 app.use(cors());
@@ -8,14 +9,25 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ===== CONFIG =====
 // Must match what Base44 will send
-const SERVICE_TOKEN = "trendforge_service_token";
+const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "trendforge_service_token";
 
 // Must match your Base44 ingestTrendResults secret
-const INGEST_SECRET = "tf_ingest_6f5d4b9b9f7c44f6b8a0c2d9d3e1a7f1";
+const INGEST_SECRET = process.env.INGEST_SECRET || "tf_ingest_6f5d4b9b9f7c44f6b8a0c2d9d3e1a7f1";
 
-// 🔴 REPLACE THESE WITH YOUR REAL BASE44 ENDPOINT URLs
-const BASE44_INGEST_URL = "https://app.base44.com/apps/6953c58286976a82485fdded/editor/workspace/code?filePath=functions%2FingestTrendResults";
-const BASE44_ERROR_URL = "https://app.base44.com/apps/6953c58286976a82485fdded/editor/workspace/code?filePath=functions%2FmarkTrendRunError";
+// Base44 config
+const BASE44_APP_ID = process.env.BASE44_APP_ID || "6953c58286976a82485fdded";
+const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN; // <-- set this in Render env vars
+const BASE44_SERVER_URL = process.env.BASE44_SERVER_URL || "https://base44.app";
+
+if (!BASE44_SERVICE_TOKEN) {
+  console.warn("⚠️ BASE44_SERVICE_TOKEN is not set. Set it in environment variables.");
+}
+
+const base44 = createClient({
+  serverUrl: BASE44_SERVER_URL,
+  appId: BASE44_APP_ID,
+  serviceToken: BASE44_SERVICE_TOKEN,
+});
 
 // ===== AUTH (Base44 → Trend Service) =====
 function requireAuth(req, res, next) {
@@ -54,17 +66,23 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/scan", requireAuth, async (req, res) => {
-  const { nicheName, platforms } = req.body || {};
-  const p = Array.isArray(platforms) ? platforms : ["reddit"];
+  const { trendRunId, nicheName, platforms } = req.body || {};
+  if (!trendRunId) return res.status(400).send("Missing trendRunId");
 
-  // TEMP test items (we’ll replace with real Reddit next)
+  // ✅ respond immediately (only once)
+  res.json({ ok: true });
+
+  // Normalize platforms
+  const p = Array.isArray(platforms) && platforms.length ? platforms : ["reddit"];
+
+  // TEMP test items
   const items = [
     {
       platform: "reddit",
       topicTitle: `TrendForge test: ${nicheName || "General"}`,
       topicSummary: "If you see this, Base44 <-> Node scan works.",
       sourceUrl: "https://reddit.com",
-      queryUsed: "test",
+      queryUsed: `test:${p.join(",")}`,
       publishedAt: new Date().toISOString(),
       author: "trendforge",
       metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
@@ -74,9 +92,20 @@ app.post("/scan", requireAuth, async (req, res) => {
     }
   ];
 
-  return res.json({ ok: true, items });
+  try {
+    // ✅ call your Base44 function by name (this is the key!)
+    await base44.asServiceRole.functions.invoke("ingestTrendResults", {
+      trendRunId,
+      items,
+    });
+  } catch (err) {
+    // mark TrendRun as ERROR in Base44 if anything fails
+    await base44.asServiceRole.functions.invoke("markTrendRunError", {
+      trendRunId,
+      message: err?.message || String(err),
+    });
+  }
 });
-
 
 // ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
