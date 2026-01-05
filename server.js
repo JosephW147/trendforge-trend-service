@@ -35,7 +35,7 @@ async function postToBase44(url, payload) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-trendforge-secret": INGEST_SECRET,
+      "x-trendforge-secret": process.env.INGEST_SECRET,
     },
     body: JSON.stringify(payload),
   });
