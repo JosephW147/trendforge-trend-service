@@ -66,44 +66,62 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/scan", requireAuth, async (req, res) => {
-  const { trendRunId, nicheName, platforms } = req.body || {};
+  console.log("🔥 /scan HIT", new Date().toISOString());
+  console.log("Headers:", req.headers);
+  console.log("Body:", req.body);
+
+  const { trendRunId, nicheName } = req.body || {};
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
 
-  // ✅ respond immediately (only once)
+  // respond immediately so Base44 doesn't timeout
   res.json({ ok: true });
 
-  // Normalize platforms
-  const p = Array.isArray(platforms) && platforms.length ? platforms : ["reddit"];
-
-  // TEMP test items
-  const items = [
-    {
-      platform: "reddit",
-      topicTitle: `TrendForge test: ${nicheName || "General"}`,
-      topicSummary: "If you see this, Base44 <-> Node scan works.",
-      sourceUrl: "https://reddit.com",
-      queryUsed: `test:${p.join(",")}`,
-      publishedAt: new Date().toISOString(),
-      author: "trendforge",
-      metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
-      trendScore: 80,
-      riskScore: 10,
-      clusterId: `test_${Date.now()}`
-    }
-  ];
-
   try {
-    // ✅ call your Base44 function by name (this is the key!)
-    await base44.asServiceRole.functions.invoke("ingestTrendResults", {
-      trendRunId,
-      items,
+    const items = [
+      {
+        platform: "reddit",
+        topicTitle: `TrendForge test: ${nicheName || "General"}`,
+        topicSummary: "If you see this, Base44 <-> Trend Service works.",
+        sourceUrl: "https://reddit.com",
+        queryUsed: "test",
+        publishedAt: new Date().toISOString(),
+        author: "trendforge",
+        metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
+        trendScore: 80,
+        riskScore: 10,
+        clusterId: `test_${Date.now()}`
+      }
+    ];
+
+    // ✅ IMPORTANT: call Base44 ingest function
+    await fetch(process.env.BASE44_INGEST_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-trendforge-secret": process.env.INGEST_SECRET
+      },
+      body: JSON.stringify({ trendRunId, items })
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`Ingest failed ${r.status}: ${await r.text()}`);
     });
+
+    console.log("✅ Sent items to Base44 ingest successfully.");
   } catch (err) {
-    // mark TrendRun as ERROR in Base44 if anything fails
-    await base44.asServiceRole.functions.invoke("markTrendRunError", {
-      trendRunId,
-      message: err?.message || String(err),
-    });
+    console.error("❌ Scan pipeline failed:", err.message);
+
+    // ✅ call Base44 error function
+    try {
+      await fetch(process.env.BASE44_ERROR_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-trendforge-secret": process.env.INGEST_SECRET
+        },
+        body: JSON.stringify({ trendRunId, message: err.message })
+      });
+    } catch (e) {
+      console.error("❌ Failed to notify Base44 error endpoint:", e.message);
+    }
   }
 });
 
