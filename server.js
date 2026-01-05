@@ -45,15 +45,18 @@ async function postToBase44(url, payload) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-trendforge-secret": INGEST_SECRET,
+      "x-trendforge-secret": process.env.INGEST_SECRET, // must exist in Render env
     },
     body: JSON.stringify(payload),
   });
 
+  const text = await resp.text();
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`${resp.status} ${text}`);
+    throw new Error(`Base44 call failed ${resp.status}: ${text}`);
   }
+
+  // optional: return parsed json if you want
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 // ===== MAIN ENDPOINT =====
@@ -77,23 +80,39 @@ app.post("/scan", requireAuth, async (req, res) => {
   res.json({ ok: true });
 
   try {
-    const items = [
-      {
-        platform: "reddit",
-        topicTitle: `TrendForge test: ${nicheName || "General"}`,
-        topicSummary: "If you see this, Base44 <-> Trend Service works.",
-        sourceUrl: "https://reddit.com",
-        queryUsed: "test",
-        publishedAt: new Date().toISOString(),
-        author: "trendforge",
-        metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
-        trendScore: 80,
-        riskScore: 10,
-        clusterId: `test_${Date.now()}`
-      }
-    ];
+  const items = [
+    {
+      platform: "reddit",
+      topicTitle: `TrendForge test: ${nicheName || "General"}`,
+      topicSummary: "If you see this, Base44 <-> Trend Service works.",
+      sourceUrl: "https://reddit.com",
+      queryUsed: "test",
+      publishedAt: new Date().toISOString(),
+      author: "trendforge",
+      metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
+      trendScore: 80,
+      riskScore: 10,
+      clusterId: `test_${Date.now()}`
+    }
+  ];
 
-    // ✅ IMPORTANT: call Base44 ingest function
+  console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
+
+  await postToBase44(process.env.BASE44_INGEST_URL, { trendRunId, items });
+
+  console.log("✅ Sent items to Base44 ingest successfully.");
+} catch (err) {
+  console.error("❌ Scan pipeline failed:", err.message);
+  console.log("➡️ Calling Base44 error:", process.env.BASE44_ERROR_URL);
+
+  try {
+    await postToBase44(process.env.BASE44_ERROR_URL, { trendRunId, message: err.message });
+  } catch (e) {
+    console.error("❌ Failed to notify Base44 error endpoint:", e.message);
+  }
+}
+
+// ✅ IMPORTANT: call Base44 ingest function
     await fetch(process.env.BASE44_INGEST_URL, {
       method: "POST",
       headers: {
