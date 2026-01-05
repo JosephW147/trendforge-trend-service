@@ -5,7 +5,7 @@ import { createClient } from "@base44/sdk";
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.get("/health", (req, res) => res.json({ ok: true }));
+
 
 // ===== CONFIG =====
 // Must match what Base44 will send
