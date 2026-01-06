@@ -1,6 +1,11 @@
 import express from "express";
 import cors from "cors";
 import { collectYouTubeTrends } from "./youtubeCollector.js";
+import { collectGdelt } from "./collectors/gdelt.js";
+import { collectRss } from "./collectors/rss.js";
+import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
+import { normalizeTrendItem } from "./normalize/trendItem.js";
+import { scoreItem } from "./scoring/score.js";
 
 const app = express();
 app.use(cors());
@@ -151,18 +156,60 @@ app.post("/scan", requireAuth, async (req, res) => {
 
   try {
     const requested = (platforms || []).map(p => String(p).toLowerCase().trim());
+let rawItems = [];
 
-    let items = [];
+// ---- YOUTUBE ----
+if (requested.includes("youtube")) {
+  const ytItems = await collectYouTubeTrends({
+    nicheName,
+    region,
+    maxResults: 15
+  });
+  rawItems.push(...ytItems);
+}
 
-    if (requested.includes("youtube")) {
-      const ytItems = await collectYouTubeTrends({ nicheName, region, maxResults: 15 });
-      items = items.concat(ytItems);
-    }
+// ---- NEWS (GDELT + RSS) ----
+if (requested.includes("news")) {
+  const gdeltItems = await collectGdelt({
+    nicheName,
+    max: 25
+  });
 
-    // If no items, throw so markTrendRunError runs (or you can mark DONE with 0)
-    if (!items.length) throw new Error("No items collected (YouTube returned 0 results)");
+  const rssItems = await collectRss({
+    feeds: DEFAULT_RSS_FEEDS,
+    nicheName,
+    maxPerFeed: 6
+  });
 
-    console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
+  rawItems.push(...gdeltItems, ...rssItems);
+}
+
+// ---- Normalize + score ----
+let items = rawItems
+  .map(normalizeTrendItem)
+  .map(it => ({
+    ...it,
+    trendScore: scoreItem(it)
+  }));
+
+// ---- Dedupe by sourceUrl ----
+const seen = new Set();
+items = items.filter(it => {
+  if (!it.sourceUrl) return false;
+  const key = it.sourceUrl.trim();
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+});
+
+// ---- Sort + cap ----
+items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
+items = items.slice(0, 20);
+
+if (!items.length) {
+  throw new Error("No items collected from requested platforms");
+}
+  console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
       items,
