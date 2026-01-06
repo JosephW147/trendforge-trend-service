@@ -15,8 +15,7 @@ if (!process.env.SERVICE_TOKEN) console.warn("⚠️ SERVICE_TOKEN is missing");
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "trendforge_service_token";
 
 // Must match EXPECTED_SECRET in Base44 ingestTrendResults
-const INGEST_SECRET =
-  process.env.INGEST_SECRET || "tf_ingest_6f5d4b9b9f7c44f6b8a0c2d9d3e1a7f1";
+const INGEST_SECRET = process.env.INGEST_SECRET || "tf_ingest_6f5d4b9b9f7c44f6b8a0c2d9d3e1a7f1";
 
 // ===== AUTH (Base44 → Trend Service) =====
 function requireAuth(req, res, next) {
@@ -52,6 +51,83 @@ async function postToBase44(url, payload) {
   }
 }
 
+// ===== Reddit helpers (public JSON) =====
+const REDDIT_UA =
+  process.env.REDDIT_USER_AGENT ||
+  "TrendForge/1.0 (render; contact: you@example.com)";
+
+const REDDIT_LIMIT = Number(process.env.REDDIT_LIMIT || 10); // keep small to avoid rate limits
+
+function hoursSince(utcSeconds) {
+  const ms = utcSeconds * 1000;
+  return Math.max(0.1, (Date.now() - ms) / 36e5);
+}
+
+function computeTrendScore({ score, num_comments, created_utc }) {
+  const ageHours = hoursSince(created_utc);
+  const velocity = (score + 2 * num_comments) / ageHours; // simple “engagement per hour”
+  // compress to 0–100-ish
+  const trendScore = Math.max(0, Math.min(100, Math.round(10 * Math.log10(1 + velocity) * 10)));
+  return { ageHours, velocity, trendScore };
+}
+
+async function fetchRedditSearchPosts(query) {
+  const url = new URL("https://www.reddit.com/search.json");
+  url.searchParams.set("q", query);
+  url.searchParams.set("sort", "top");
+  url.searchParams.set("t", "day");
+  url.searchParams.set("limit", String(REDDIT_LIMIT));
+
+  const r = await fetch(url.toString(), {
+    headers: { "User-Agent": REDDIT_UA },
+  });
+
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Reddit search failed ${r.status}: ${text}`);
+  }
+
+  const json = await r.json();
+  const children = json?.data?.children || [];
+  return children.map((c) => c.data).filter(Boolean);
+}
+
+function redditToItem(post, nicheName) {
+  const title = (post?.title || "").trim();
+  const permalink = post?.permalink ? `https://www.reddit.com${post.permalink}` : "";
+  const subreddit = post?.subreddit || "";
+  const author = post?.author || "";
+
+  const { ageHours, velocity, trendScore } = computeTrendScore({
+    score: post?.score ?? 0,
+    num_comments: post?.num_comments ?? 0,
+    created_utc: post?.created_utc ?? Math.floor(Date.now() / 1000),
+  });
+
+  // basic “risk” placeholder (to be improved later)
+  const riskScore = 10;
+
+  return {
+    platform: "reddit",
+    topicTitle: title || `Reddit trend: ${nicheName}`,
+    topicSummary: `r/${subreddit} • score ${post?.score ?? 0} • comments ${post?.num_comments ?? 0}`,
+    sourceUrl: permalink || "https://www.reddit.com",
+    queryUsed: nicheName,
+    publishedAt: post?.created_utc ? new Date(post.created_utc * 1000).toISOString() : new Date().toISOString(),
+    author,
+    metrics: {
+      subreddit,
+      upvotes: post?.score ?? 0,
+      comments: post?.num_comments ?? 0,
+      ageHours: Number(ageHours.toFixed(2)),
+      velocity: Number(velocity.toFixed(2)),
+    },
+    trendScore,
+    riskScore,
+    clusterId: `reddit_${subreddit}_${post?.id || Date.now()}`,
+  };
+}
+
 // ===== MAIN ENDPOINTS =====
 app.get("/", (req, res) => {
   res.status(200).send("TrendForge Trend Service is running ✅");
@@ -72,37 +148,37 @@ app.post("/scan", requireAuth, async (req, res) => {
   res.json({ ok: true });
 
   try {
-    const items = [
-      {
-        platform: "reddit",
-        topicTitle: `TrendForge test: ${nicheName || "General"}`,
-        topicSummary: "If you see this, Base44 <-> Trend Service works.",
-        sourceUrl: "https://reddit.com",
-        queryUsed: "test",
-        publishedAt: new Date().toISOString(),
-        author: "trendforge",
-        metrics: { upvotes: 100, comments: 10, ageHours: 1, velocity: 110 },
-        trendScore: 80,
-        riskScore: 10,
-        clusterId: `test_${Date.now()}`,
-      },
-    ];
+    let items = [];
+
+    const p = Array.isArray(platforms) ? platforms.map(x => String(x).toLowerCase()) : ["reddit"];
+
+    if (p.includes("reddit")) {
+      const posts = await fetchRedditSearchPosts(nicheName);
+      items.push(...posts.map(post => redditToItem(post, nicheName)));
+    }
+
+    // de-dupe by sourceUrl
+    const seen = new Set();
+    items = items.filter(it => {
+      if (!it.sourceUrl) return false;
+      if (seen.has(it.sourceUrl)) return false;
+      seen.add(it.sourceUrl);
+      return true;
+    });
+
+    if (items.length === 0) throw new Error("No items returned from Reddit");
+
+    console.log(`✅ Built ${items.length} items. Sending to ingestTrendResults...`);
 
     console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
-    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
-      trendRunId,
-      items,
-    });
+    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, { trendRunId, items });
     console.log("✅ Base44 ingest response:", ingestResp);
   } catch (err) {
     console.error("❌ Scan pipeline failed:", err.message);
 
     try {
       console.log("➡️ Calling Base44 error:", process.env.BASE44_ERROR_URL);
-      const errResp = await postToBase44(process.env.BASE44_ERROR_URL, {
-        trendRunId,
-        message: err.message,
-      });
+      const errResp = await postToBase44(process.env.BASE44_ERROR_URL, { trendRunId, message: err.message });
       console.log("✅ Base44 error response:", errResp);
     } catch (e) {
       console.error("❌ Failed to notify Base44 error endpoint:", e.message);
@@ -112,6 +188,4 @@ app.post("/scan", requireAuth, async (req, res) => {
 
 // ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`TrendForge Trend Service running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`TrendForge Trend Service running on port ${PORT}`));
