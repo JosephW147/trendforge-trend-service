@@ -4,7 +4,7 @@ export function normalizeTrendItem(x) {
   const sourceUrl = String(x?.sourceUrl || "").trim();
 
   return {
-    platform,
+    platform: "news",
     topicTitle,
     topicSummary: String(x?.topicSummary || ""),
     queryUsed: String(x?.queryUsed || ""),
