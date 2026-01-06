@@ -155,6 +155,8 @@ app.post("/scan", requireAuth, async (req, res) => {
   res.json({ ok: true });
 
   try {
+    console.log("✅ SCAN PIPELINE v2 (YT+NEWS) running");
+
     const requested = (platforms || []).map(p => String(p).toLowerCase().trim());
 let rawItems = [];
 
@@ -167,6 +169,8 @@ if (requested.includes("youtube")) {
   });
   rawItems.push(...ytItems);
 }
+if (requested.includes("youtube")) console.log("▶ running youtube collector");
+if (requested.includes("news")) console.log("▶ running news collectors (GDELT + RSS)");
 
 // ---- NEWS (GDELT + RSS) ----
 if (requested.includes("news")) {
@@ -183,6 +187,8 @@ if (requested.includes("news")) {
 
   rawItems.push(...gdeltItems, ...rssItems);
 }
+if (requested.includes("youtube")) console.log("▶ running youtube collector");
+if (requested.includes("news")) console.log("▶ running news collectors (GDELT + RSS)");
 
 // ---- Normalize + score ----
 let items = rawItems
