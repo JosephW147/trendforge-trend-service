@@ -141,25 +141,35 @@ app.post("/scan", requireAuth, async (req, res) => {
   console.log("🔥 /scan HIT", new Date().toISOString());
   console.log("Body:", req.body);
 
-  const { trendRunId, nicheName } = req.body || {};
+  // ✅ Always destructure platforms with a default
+  const {
+    trendRunId,
+    nicheName = "Global",
+    platforms = ["reddit"],
+    region = "Global",
+  } = req.body || {};
+
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
 
   // respond immediately so Base44 doesn't timeout
   res.json({ ok: true });
 
   try {
-    let items = [];
+    // ✅ Normalize platforms safely
+    const p = Array.isArray(platforms)
+      ? platforms.map((x) => String(x).toLowerCase().trim())
+      : ["reddit"];
 
-    const p = Array.isArray(platforms) ? platforms.map(x => String(x).toLowerCase()) : ["reddit"];
+    let items = [];
 
     if (p.includes("reddit")) {
       const posts = await fetchRedditSearchPosts(nicheName);
-      items.push(...posts.map(post => redditToItem(post, nicheName)));
+      items.push(...posts.map((post) => redditToItem(post, nicheName)));
     }
 
     // de-dupe by sourceUrl
     const seen = new Set();
-    items = items.filter(it => {
+    items = items.filter((it) => {
       if (!it.sourceUrl) return false;
       if (seen.has(it.sourceUrl)) return false;
       seen.add(it.sourceUrl);
@@ -169,16 +179,23 @@ app.post("/scan", requireAuth, async (req, res) => {
     if (items.length === 0) throw new Error("No items returned from Reddit");
 
     console.log(`✅ Built ${items.length} items. Sending to ingestTrendResults...`);
-
     console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
-    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, { trendRunId, items });
+
+    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
+      trendRunId,
+      items,
+    });
+
     console.log("✅ Base44 ingest response:", ingestResp);
   } catch (err) {
     console.error("❌ Scan pipeline failed:", err.message);
 
     try {
       console.log("➡️ Calling Base44 error:", process.env.BASE44_ERROR_URL);
-      const errResp = await postToBase44(process.env.BASE44_ERROR_URL, { trendRunId, message: err.message });
+      const errResp = await postToBase44(process.env.BASE44_ERROR_URL, {
+        trendRunId,
+        message: err.message,
+      });
       console.log("✅ Base44 error response:", errResp);
     } catch (e) {
       console.error("❌ Failed to notify Base44 error endpoint:", e.message);
