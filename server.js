@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { collectYouTubeTrends } from "./youtubeCollector.js";
 
 const app = express();
 app.use(cors());
@@ -137,56 +138,37 @@ app.get("/health", (req, res) => {
   res.status(200).json({ ok: true, service: "trendforge-trend-service" });
 });
 
+
 app.post("/scan", requireAuth, async (req, res) => {
   console.log("🔥 /scan HIT", new Date().toISOString());
   console.log("Body:", req.body);
 
-  // ✅ Always destructure platforms with a default
-  const {
-    trendRunId,
-    nicheName = "Global",
-    platforms = ["reddit"],
-    region = "Global",
-  } = req.body || {};
-
+  const { trendRunId, nicheName, platforms = ["youtube"], region = "Global" } = req.body || {};
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
 
   // respond immediately so Base44 doesn't timeout
   res.json({ ok: true });
 
   try {
-    // ✅ Normalize platforms safely
-    const p = Array.isArray(platforms)
-      ? platforms.map((x) => String(x).toLowerCase().trim())
-      : ["reddit"];
+    const requested = (platforms || []).map(p => String(p).toLowerCase().trim());
 
     let items = [];
 
-    if (p.includes("reddit")) {
-      const posts = await fetchRedditSearchPosts(nicheName);
-      items.push(...posts.map((post) => redditToItem(post, nicheName)));
+    if (requested.includes("youtube")) {
+      const ytItems = await collectYouTubeTrends({ nicheName, region, maxResults: 15 });
+      items = items.concat(ytItems);
     }
 
-    // de-dupe by sourceUrl
-    const seen = new Set();
-    items = items.filter((it) => {
-      if (!it.sourceUrl) return false;
-      if (seen.has(it.sourceUrl)) return false;
-      seen.add(it.sourceUrl);
-      return true;
-    });
+    // If no items, throw so markTrendRunError runs (or you can mark DONE with 0)
+    if (!items.length) throw new Error("No items collected (YouTube returned 0 results)");
 
-    if (items.length === 0) throw new Error("No items returned from Reddit");
-
-    console.log(`✅ Built ${items.length} items. Sending to ingestTrendResults...`);
     console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
-
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
       items,
     });
-
     console.log("✅ Base44 ingest response:", ingestResp);
+
   } catch (err) {
     console.error("❌ Scan pipeline failed:", err.message);
 
