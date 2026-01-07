@@ -21,7 +21,6 @@ const BASE44_BUILD_TOPICS_URL =
 
 // ---- Env sanity ----
 if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
-if (!process.env.BASE44_TOPICS_INGEST_URL) console.warn("⚠️ BASE44_BUILD_TOPICS_URL is missing");
 if (!process.env.BASE44_ERROR_URL) console.warn("⚠️ BASE44_ERROR_URL is missing");
 if (!process.env.INGEST_SECRET) console.warn("⚠️ INGEST_SECRET is missing");
 if (!process.env.SERVICE_TOKEN) console.warn("⚠️ SERVICE_TOKEN is missing");
