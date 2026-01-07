@@ -97,6 +97,10 @@ app.post("/scan", requireAuth, async (req, res) => {
     if (requested.includes("youtube")) {
       console.log("▶ running youtube collector");
       const ytItems = await collectYouTubeTrends({ nicheName, region, maxResults: 15 });
+
+      console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
+      console.log("🎥 ytItems sample (raw):", ytItems?.[0]);
+
       rawItems.push(...ytItems);
     }
 
@@ -120,6 +124,17 @@ app.post("/scan", requireAuth, async (req, res) => {
         platform: (it.platform || "").toLowerCase().trim(),
         trendScore: scoreItem(it),
       }));
+    
+    console.log("🧪 normalized items count:", items.length);
+    console.log("🧪 normalized sample:", items[0]);
+
+    const platformCounts = items.reduce((a, it) => {
+      const p = (it.platform || "unknown").toLowerCase();
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("📊 platformCounts BEFORE dedupe:", platformCounts);
+
 
     // dedupe by platform + sourceUrl
     const seen = new Set();
@@ -129,6 +144,14 @@ app.post("/scan", requireAuth, async (req, res) => {
       seen.add(key);
       return true;
     });
+
+    const platformCountsAfter = items.reduce((a, it) => {
+      const p = (it.platform || "unknown").toLowerCase();
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("📊 platformCounts AFTER dedupe:", platformCountsAfter);
+
 
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
     items = items.slice(0, 20);
