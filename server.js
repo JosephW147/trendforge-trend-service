@@ -10,11 +10,12 @@ import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItem } from "./scoring/score.js";
 
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Base44 function to compute topics from TrendItems already stored for a TrendRun
+// (You said you have buildTrendTopicsFromRun, not ingestTrendTopics)
 const BASE44_BUILD_TOPICS_URL =
   process.env.BASE44_BUILD_TOPICS_URL ||
   "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendTopicsFromRun";
@@ -92,6 +93,7 @@ function normalizeRequestedPlatforms(input = []) {
 app.get("/", (req, res) =>
   res.status(200).send("TrendForge Trend Service is running ✅")
 );
+
 app.get("/health", (req, res) =>
   res.status(200).json({ ok: true, service: "trendforge-trend-service" })
 );
@@ -215,7 +217,7 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("📊 platformCounts AFTER dedupe:", platformCountsAfter);
 
-    // 4) Sort by score (still no slicing)
+    // 4) Sort by score
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
 
     const topCounts = items.slice(0, 20).reduce((a, it) => {
@@ -225,15 +227,11 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
 
-    // 5) Choose what to STORE vs what to SHOW
-    // STORE: keep a big pool so Base44 clustering works
+    // 5) STORE pool (important for Base44 topic clustering)
     const MAX_STORE = 120;
-
-    // Always sort first (you already did)
     const storeItems = items.slice(0, MAX_STORE);
 
-    // Optional: small "variety" selection for UI (still 20) — TEMP only
-    // Best long-term is driving dashboard from TrendTopics instead of TrendItems.
+    // Optional: show mix for UI debugging (not used for ingest)
     const FINAL_LIMIT = 20;
     const YT_QUOTA = 8;
     const NEWS_QUOTA = 12;
@@ -243,7 +241,6 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     let finalItems = [...youtubeTop, ...newsTop];
 
-    // Fill remaining slots from best leftovers
     if (finalItems.length < FINAL_LIMIT) {
       const pickedUrls = new Set(finalItems.map((i) => i.sourceUrl));
       const leftovers = storeItems.filter((i) => !pickedUrls.has(i.sourceUrl));
@@ -255,7 +252,7 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("✅ STORE TrendItems count:", storeItems.length);
     console.log("✅ SHOW TrendItems count:", finalItems.length);
 
-    // 6) Ingest TrendItems
+    // 6) Ingest TrendItems (STORE pool)
     console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
@@ -263,6 +260,7 @@ app.post("/scan", requireAuth, async (req, res) => {
       items: storeItems,
     });
     console.log("✅ Base44 TrendItems ingest response:", ingestResp);
+
     const storeCounts = storeItems.reduce((a, it) => {
       const p = (it.platform || "unknown").toLowerCase();
       a[p] = (a[p] || 0) + 1;
@@ -270,15 +268,16 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("📦 STORE platformCounts:", storeCounts);
 
-    // 7) Build TrendTopics in Base44 from stored TrendItems (recommended)
+    // 7) Build TrendTopics in Base44 from stored TrendItems
     console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
-
     try {
       const topicsResp = await postToBase44(BASE44_BUILD_TOPICS_URL, { trendRunId });
       console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
     } catch (e) {
       console.error("❌ Base44 buildTrendTopicsFromRun failed:", e?.message || e);
     }
+  } catch (err) {
+    console.error("❌ Scan pipeline failed:", err?.message || err);
 
     // Best-effort error callback to Base44
     try {
