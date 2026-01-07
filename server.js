@@ -291,7 +291,6 @@ app.post("/scan", requireAuth, async (req, res) => {
       const topicsResp = await postToBase44(process.env.BASE44_TOPICS_INGEST_URL, {
         trendRunId,
         projectId,
-        topics,
       });
       console.log("✅ Base44 TrendTopics ingest response:", topicsResp);
     } else {
