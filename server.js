@@ -9,7 +9,7 @@ import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
 
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItem } from "./scoring/score.js";
-import { buildTrendTopics } from "./topics/buildTrendTopics.js";
+
 
 const app = express();
 app.use(cors());
@@ -225,23 +225,7 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
 
-    // 5) Build TrendTopics from ALL deduped items (best practice)
-    const topics = buildTrendTopics({
-      trendRunId,
-      projectId,
-      items,
-      options: {
-        similarityThreshold: 0.55,
-        maxTopics: 30,
-        freshnessHalfLifeHours: 24,
-        freshnessMaxHours: 72,
-      },
-    });
-
-    console.log("🧩 TrendTopics built:", topics.length);
-    console.log("🧩 Top topic sample:", topics[0]);
-
-    // 6) Choose what to STORE vs what to SHOW
+    // 5) Choose what to STORE vs what to SHOW
     // STORE: keep a big pool so Base44 clustering works
     const MAX_STORE = 120;
 
@@ -271,7 +255,7 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("✅ STORE TrendItems count:", storeItems.length);
     console.log("✅ SHOW TrendItems count:", finalItems.length);
 
-    // 7) Ingest TrendItems
+    // 6) Ingest TrendItems
     console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
@@ -286,21 +270,15 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("📦 STORE platformCounts:", storeCounts);
 
-    // 8) Ingest TrendTopics (if configured)
-    console.log("TOPICS ingest URL:", process.env.BASE44_TOPICS_INGEST_URL || "(missing)");
-    console.log("TOPICS count about to ingest:", topics?.length ?? 0);
-    if (process.env.BASE44_TOPICS_INGEST_URL) {
-      console.log("➡️ Calling Base44 TrendTopics ingest:", process.env.BASE44_TOPICS_INGEST_URL);
-      const topicsResp = await postToBase44(process.env.BASE44_TOPICS_INGEST_URL, {
-        trendRunId,
-        projectId,
-      });
-      console.log("✅ Base44 TrendTopics ingest response:", topicsResp);
-    } else {
-      console.warn("⚠️ Skipping TrendTopics ingest: BASE44_TOPICS_INGEST_URL not set");
+    // 7) Build TrendTopics in Base44 from stored TrendItems (recommended)
+    console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
+
+    try {
+      const topicsResp = await postToBase44(BASE44_BUILD_TOPICS_URL, { trendRunId });
+      console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
+    } catch (e) {
+      console.error("❌ Base44 buildTrendTopicsFromRun failed:", e?.message || e);
     }
-  } catch (err) {
-    console.error("❌ Scan pipeline failed:", err?.message || err);
 
     // Best-effort error callback to Base44
     try {
