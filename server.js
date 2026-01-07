@@ -215,12 +215,12 @@ app.post("/scan", requireAuth, async (req, res) => {
     // 4) Sort by score (still no slicing)
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
 
-    const topCounts = items.slice(0, 30).reduce((a, it) => {
+    const topCounts = items.slice(0, 20).reduce((a, it) => {
       const p = (it.platform || "unknown").toLowerCase();
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
-    console.log("🏆 platformCounts in top 30 after scoring:", topCounts);
+    console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
 
     // 5) Build TrendTopics from ALL deduped items (best practice)
     const topics = buildTrendTopics({
@@ -238,50 +238,50 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("🧩 TrendTopics built:", topics.length);
     console.log("🧩 Top topic sample:", topics[0]);
 
-    // 6) (Optional) Guarantee mix in the final 20 TrendItems (for dashboard variety)
-    // You can remove this later once the dashboard is driven by TrendTopics.
+    // 6) Choose what to STORE vs what to SHOW
+    // STORE: keep a big pool so Base44 clustering works
+    const MAX_STORE = 120;
+
+    // Always sort first (you already did)
+    const storeItems = items.slice(0, MAX_STORE);
+
+    // Optional: small "variety" selection for UI (still 20) — TEMP only
+    // Best long-term is driving dashboard from TrendTopics instead of TrendItems.
     const FINAL_LIMIT = 20;
     const YT_QUOTA = 8;
     const NEWS_QUOTA = 12;
 
-    const youtubeTop = items.filter((i) => i.platform === "youtube").slice(0, YT_QUOTA);
-    const newsTop = items.filter((i) => i.platform === "news").slice(0, NEWS_QUOTA);
+    const youtubeTop = storeItems.filter((i) => i.platform === "youtube").slice(0, YT_QUOTA);
+    const newsTop = storeItems.filter((i) => i.platform === "news").slice(0, NEWS_QUOTA);
 
     let finalItems = [...youtubeTop, ...newsTop];
 
     // Fill remaining slots from best leftovers
     if (finalItems.length < FINAL_LIMIT) {
       const pickedUrls = new Set(finalItems.map((i) => i.sourceUrl));
-      const leftovers = items.filter((i) => !pickedUrls.has(i.sourceUrl));
+      const leftovers = storeItems.filter((i) => !pickedUrls.has(i.sourceUrl));
       finalItems = [...finalItems, ...leftovers].slice(0, FINAL_LIMIT);
     } else {
       finalItems = finalItems.slice(0, FINAL_LIMIT);
     }
 
-    const finalCounts = finalItems.reduce((a, it) => {
-      const p = (it.platform || "unknown").toLowerCase();
-      a[p] = (a[p] || 0) + 1;
-      return a;
-    }, {});
-    console.log("✅ FINAL platformCounts in top 20 being ingested:", finalCounts);
-
-    console.log("🏆 top #1 item after scoring:", {
-      platform: finalItems[0]?.platform,
-      trendScore: finalItems[0]?.trendScore,
-      sourceUrl: finalItems[0]?.sourceUrl,
-      title: finalItems[0]?.topicTitle,
-    });
-
-    if (!finalItems.length) throw new Error("No items collected from requested platforms");
+    console.log("✅ STORE TrendItems count:", storeItems.length);
+    console.log("✅ SHOW TrendItems count:", finalItems.length);
 
     // 7) Ingest TrendItems
     console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
       projectId,
-      items: finalItems,
+      items: storeItems,
     });
     console.log("✅ Base44 TrendItems ingest response:", ingestResp);
+    const storeCounts = storeItems.reduce((a, it) => {
+      const p = (it.platform || "unknown").toLowerCase();
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("📦 STORE platformCounts:", storeCounts);
 
     // 8) Ingest TrendTopics (if configured)
     if (process.env.BASE44_TOPICS_INGEST_URL) {
