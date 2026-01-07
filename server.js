@@ -284,6 +284,8 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("📦 STORE platformCounts:", storeCounts);
 
     // 8) Ingest TrendTopics (if configured)
+    console.log("TOPICS ingest URL:", process.env.BASE44_TOPICS_INGEST_URL || "(missing)");
+    console.log("TOPICS count about to ingest:", topics?.length ?? 0);
     if (process.env.BASE44_TOPICS_INGEST_URL) {
       console.log("➡️ Calling Base44 TrendTopics ingest:", process.env.BASE44_TOPICS_INGEST_URL);
       const topicsResp = await postToBase44(process.env.BASE44_TOPICS_INGEST_URL, {
