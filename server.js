@@ -15,6 +15,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const BASE44_BUILD_TOPICS_URL =
+  process.env.BASE44_BUILD_TOPICS_URL ||
+  "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendTopicsFromRun";
+
 // ---- Env sanity ----
 if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
 if (!process.env.BASE44_TOPICS_INGEST_URL) console.warn("⚠️ BASE44_TOPICS_INGEST_URL is missing");
