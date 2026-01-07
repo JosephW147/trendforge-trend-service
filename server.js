@@ -1,17 +1,23 @@
+// server.js
 import express from "express";
 import cors from "cors";
+
 import { collectYouTubeTrends } from "./youtubeCollector.js";
 import { collectGdelt } from "./collectors/gdelt.js";
 import { collectRss } from "./collectors/rss.js";
 import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
+
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItem } from "./scoring/score.js";
+import { buildTrendTopics } from "./topics/buildTrendTopics.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ---- Env sanity ----
 if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
+if (!process.env.BASE44_TOPICS_INGEST_URL) console.warn("⚠️ BASE44_TOPICS_INGEST_URL is missing");
 if (!process.env.BASE44_ERROR_URL) console.warn("⚠️ BASE44_ERROR_URL is missing");
 if (!process.env.INGEST_SECRET) console.warn("⚠️ INGEST_SECRET is missing");
 if (!process.env.SERVICE_TOKEN) console.warn("⚠️ SERVICE_TOKEN is missing");
@@ -20,6 +26,7 @@ const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "trendforge_service_token";
 const INGEST_SECRET =
   process.env.INGEST_SECRET || "tf_ingest_6f5d4b9b9f7c44f6b8a0c2d9d3e1a7f1";
 
+// ---- Auth middleware ----
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -30,7 +37,10 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ---- Base44 POST helper ----
 async function postToBase44(url, payload) {
+  if (!url) throw new Error("postToBase44: missing url");
+
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -50,7 +60,7 @@ async function postToBase44(url, payload) {
   }
 }
 
-// ✅ Normalize requested platforms (treat old ones as "news")
+// ✅ Normalize requested platforms (treat legacy socials as "news" if they appear)
 function normalizeRequestedPlatforms(input = []) {
   const set = new Set((input || []).map((p) => String(p).toLowerCase().trim()));
   const supported = new Set();
@@ -70,38 +80,58 @@ function normalizeRequestedPlatforms(input = []) {
   ];
   if (legacyToNews.some((p) => set.has(p))) supported.add("news");
 
+  // default
   if (supported.size === 0) supported.add("youtube");
   return [...supported];
 }
 
-app.get("/", (req, res) => res.status(200).send("TrendForge Trend Service is running ✅"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true, service: "trendforge-trend-service" }));
+// ---- Health ----
+app.get("/", (req, res) =>
+  res.status(200).send("TrendForge Trend Service is running ✅")
+);
+app.get("/health", (req, res) =>
+  res.status(200).json({ ok: true, service: "trendforge-trend-service" })
+);
 
+// ---- Scan ----
 app.post("/scan", requireAuth, async (req, res) => {
   console.log("🔥 /scan HIT", new Date().toISOString());
   console.log("Body:", req.body);
 
-  const { trendRunId, nicheName, platforms = ["youtube"], region = "Global" } = req.body || {};
-  if (!trendRunId) return res.status(400).send("Missing trendRunId");
+  const {
+    trendRunId,
+    projectId,
+    nicheName,
+    platforms = ["youtube"],
+    region = "Global",
+  } = req.body || {};
 
+  if (!trendRunId) return res.status(400).send("Missing trendRunId");
+  if (!projectId) return res.status(400).send("Missing projectId");
+
+  // Respond immediately (async job style)
   res.json({ ok: true });
 
   try {
-    console.log("✅ SCAN PIPELINE v2 (YT+NEWS) running");
+    console.log("✅ SCAN PIPELINE (YT + NEWS) running");
 
     const requested = normalizeRequestedPlatforms(platforms);
     console.log("✅ Requested (normalized):", requested);
 
+    // 1) Collect
     let rawItems = [];
 
     if (requested.includes("youtube")) {
       console.log("▶ running youtube collector");
-      const ytItems = await collectYouTubeTrends({ nicheName, region, maxResults: 15 });
+      const ytItems = await collectYouTubeTrends({
+        nicheName,
+        region,
+        maxResults: 15,
+      });
 
       console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
       console.log("🎥 ytItems sample (raw):", ytItems?.[0]);
-
-      rawItems.push(...ytItems);
+      rawItems.push(...(ytItems || []));
     }
 
     if (requested.includes("news")) {
@@ -114,64 +144,63 @@ app.post("/scan", requireAuth, async (req, res) => {
         maxPerFeed: 6,
       });
 
-      rawItems.push(...gdeltItems, ...rssItems);
+      rawItems.push(...(gdeltItems || []), ...(rssItems || []));
     }
 
+    // 2) Normalize + score (do NOT slice yet)
     let items = rawItems
       .map((raw) => {
-        // Preserve platform from the collector BEFORE normalization
         const originalPlatform =
           (raw.platform || raw.source || raw.provider || "").toLowerCase().trim();
 
         const normalized = normalizeTrendItem(raw);
 
+        // Keep collector platform if normalization loses it
+        const platform = (normalized.platform || originalPlatform || "unknown")
+          .toLowerCase()
+          .trim();
+
+        // Ensure a usable URL
+        const sourceUrl =
+          normalized.sourceUrl ||
+          normalized.url ||
+          normalized.link ||
+          raw.sourceUrl ||
+          raw.url ||
+          raw.link ||
+          (raw.videoId ? `https://www.youtube.com/watch?v=${raw.videoId}` : "");
+
         return {
           ...normalized,
-          // If normalizeTrendItem overwrote it, restore it here
-          platform: (normalized.platform || originalPlatform || "unknown").toLowerCase().trim(),
+          platform,
+          sourceUrl,
         };
       })
       .map((it) => ({
         ...it,
-        // Ensure URL exists for dedupe + UI
-        sourceUrl: it.sourceUrl || it.url || it.link || "",
+        // scoreItem expects item fields incl publishedAt/platform/metrics possibly
         trendScore: scoreItem(it),
       }));
-    
+
     console.log("🧪 normalized items count:", items.length);
     console.log("🧪 normalized sample:", items[0]);
 
-    const platformCounts = items.reduce((a, it) => {
+    const platformCountsBefore = items.reduce((a, it) => {
       const p = (it.platform || "unknown").toLowerCase();
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
-    console.log("📊 platformCounts BEFORE dedupe:", platformCounts);
+    console.log("📊 platformCounts BEFORE dedupe:", platformCountsBefore);
 
-    items = items.map((it) => {
-      // Normalize platform label
-      const platform = (it.platform || it.source || it.provider || "").toLowerCase().trim();
-
-      // Ensure a usable URL field
-      const url =
-        it.sourceUrl ||
-        it.url ||
-        it.link ||
-        (it.videoId ? `https://www.youtube.com/watch?v=${it.videoId}` : "");
-
-      return {
-        ...it,
-        platform,
-        sourceUrl: url,
-      };
-    });
-
-
-    // dedupe by platform + sourceUrl
+    // 3) Dedupe by platform + sourceUrl
     const seen = new Set();
     items = items.filter((it) => {
-      const key = `${it.platform}::${(it.sourceUrl || "").trim()}`;
-      if (!it.sourceUrl || seen.has(key)) return false;
+      const p = (it.platform || "unknown").toLowerCase().trim();
+      const u = (it.sourceUrl || "").trim();
+      if (!u) return false;
+
+      const key = `${p}::${u}`;
+      if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
@@ -183,10 +212,9 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("📊 platformCounts AFTER dedupe:", platformCountsAfter);
 
-
+    // 4) Sort by score (still no slicing)
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
 
-    // ✅ Sanity log: what sources are winning after scoring?
     const topCounts = items.slice(0, 30).reduce((a, it) => {
       const p = (it.platform || "unknown").toLowerCase();
       a[p] = (a[p] || 0) + 1;
@@ -194,56 +222,97 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("🏆 platformCounts in top 30 after scoring:", topCounts);
 
-    // ✅ Guarantee a mix in the final 20 (adjust numbers as you like)
+    // 5) Build TrendTopics from ALL deduped items (best practice)
+    const topics = buildTrendTopics({
+      trendRunId,
+      projectId,
+      items,
+      options: {
+        similarityThreshold: 0.55,
+        maxTopics: 30,
+        freshnessHalfLifeHours: 24,
+        freshnessMaxHours: 72,
+      },
+    });
+
+    console.log("🧩 TrendTopics built:", topics.length);
+    console.log("🧩 Top topic sample:", topics[0]);
+
+    // 6) (Optional) Guarantee mix in the final 20 TrendItems (for dashboard variety)
+    // You can remove this later once the dashboard is driven by TrendTopics.
+    const FINAL_LIMIT = 20;
     const YT_QUOTA = 8;
     const NEWS_QUOTA = 12;
 
-    const youtubeTop = items.filter(i => i.platform === "youtube").slice(0, YT_QUOTA);
-    const newsTop = items.filter(i => i.platform === "news").slice(0, NEWS_QUOTA);
+    const youtubeTop = items.filter((i) => i.platform === "youtube").slice(0, YT_QUOTA);
+    const newsTop = items.filter((i) => i.platform === "news").slice(0, NEWS_QUOTA);
 
-    let picked = [...youtubeTop, ...newsTop];
+    let finalItems = [...youtubeTop, ...newsTop];
 
-    // Fill remaining slots with highest-scoring leftovers (any platform)
-    if (picked.length < 20) {
-      const pickedUrls = new Set(picked.map(i => i.sourceUrl));
-      const leftovers = items.filter(i => !pickedUrls.has(i.sourceUrl));
-      picked = [...picked, ...leftovers].slice(0, 20);
+    // Fill remaining slots from best leftovers
+    if (finalItems.length < FINAL_LIMIT) {
+      const pickedUrls = new Set(finalItems.map((i) => i.sourceUrl));
+      const leftovers = items.filter((i) => !pickedUrls.has(i.sourceUrl));
+      finalItems = [...finalItems, ...leftovers].slice(0, FINAL_LIMIT);
+    } else {
+      finalItems = finalItems.slice(0, FINAL_LIMIT);
     }
 
-    items = picked;
-
-    // ✅ Log final mix being ingested
-    const finalCounts = items.reduce((a, it) => {
+    const finalCounts = finalItems.reduce((a, it) => {
       const p = (it.platform || "unknown").toLowerCase();
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
     console.log("✅ FINAL platformCounts in top 20 being ingested:", finalCounts);
 
-    // Optional: peek at the very top item
     console.log("🏆 top #1 item after scoring:", {
-      platform: items[0]?.platform,
-      trendScore: items[0]?.trendScore,
-      sourceUrl: items[0]?.sourceUrl,
-      title: items[0]?.topicTitle,
+      platform: finalItems[0]?.platform,
+      trendScore: finalItems[0]?.trendScore,
+      sourceUrl: finalItems[0]?.sourceUrl,
+      title: finalItems[0]?.topicTitle,
     });
 
-    
+    if (!finalItems.length) throw new Error("No items collected from requested platforms");
 
-    if (!items.length) throw new Error("No items collected from requested platforms");
+    // 7) Ingest TrendItems
+    console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
+    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
+      trendRunId,
+      projectId,
+      items: finalItems,
+    });
+    console.log("✅ Base44 TrendItems ingest response:", ingestResp);
 
-    console.log("➡️ Calling Base44 ingest:", process.env.BASE44_INGEST_URL);
-    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, { trendRunId, items });
-    console.log("✅ Base44 ingest response:", ingestResp);
+    // 8) Ingest TrendTopics (if configured)
+    if (process.env.BASE44_TOPICS_INGEST_URL) {
+      console.log("➡️ Calling Base44 TrendTopics ingest:", process.env.BASE44_TOPICS_INGEST_URL);
+      const topicsResp = await postToBase44(process.env.BASE44_TOPICS_INGEST_URL, {
+        trendRunId,
+        projectId,
+        topics,
+      });
+      console.log("✅ Base44 TrendTopics ingest response:", topicsResp);
+    } else {
+      console.warn("⚠️ Skipping TrendTopics ingest: BASE44_TOPICS_INGEST_URL not set");
+    }
   } catch (err) {
-    console.error("❌ Scan pipeline failed:", err.message);
+    console.error("❌ Scan pipeline failed:", err?.message || err);
 
+    // Best-effort error callback to Base44
     try {
-      console.log("➡️ Calling Base44 error:", process.env.BASE44_ERROR_URL);
-      const errResp = await postToBase44(process.env.BASE44_ERROR_URL, { trendRunId, message: err.message });
-      console.log("✅ Base44 error response:", errResp);
+      if (process.env.BASE44_ERROR_URL) {
+        console.log("➡️ Calling Base44 error:", process.env.BASE44_ERROR_URL);
+        const errResp = await postToBase44(process.env.BASE44_ERROR_URL, {
+          trendRunId,
+          projectId,
+          message: err?.message || String(err),
+        });
+        console.log("✅ Base44 error response:", errResp);
+      } else {
+        console.warn("⚠️ BASE44_ERROR_URL not set; cannot notify Base44 of errors.");
+      }
     } catch (e) {
-      console.error("❌ Failed to notify Base44 error endpoint:", e.message);
+      console.error("❌ Failed to notify Base44 error endpoint:", e?.message || e);
     }
   }
 });
