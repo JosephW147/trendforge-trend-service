@@ -118,10 +118,23 @@ app.post("/scan", requireAuth, async (req, res) => {
     }
 
     let items = rawItems
-      .map(normalizeTrendItem)
+      .map((raw) => {
+        // Preserve platform from the collector BEFORE normalization
+        const originalPlatform =
+          (raw.platform || raw.source || raw.provider || "").toLowerCase().trim();
+
+        const normalized = normalizeTrendItem(raw);
+
+        return {
+          ...normalized,
+          // If normalizeTrendItem overwrote it, restore it here
+          platform: (normalized.platform || originalPlatform || "unknown").toLowerCase().trim(),
+        };
+      })
       .map((it) => ({
         ...it,
-        platform: (it.platform || "").toLowerCase().trim(),
+        // Ensure URL exists for dedupe + UI
+        sourceUrl: it.sourceUrl || it.url || it.link || "",
         trendScore: scoreItem(it),
       }));
     
@@ -172,7 +185,50 @@ app.post("/scan", requireAuth, async (req, res) => {
 
 
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
-    items = items.slice(0, 20);
+
+    // ✅ Sanity log: what sources are winning after scoring?
+    const topCounts = items.slice(0, 30).reduce((a, it) => {
+      const p = (it.platform || "unknown").toLowerCase();
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("🏆 platformCounts in top 30 after scoring:", topCounts);
+
+    // ✅ Guarantee a mix in the final 20 (adjust numbers as you like)
+    const YT_QUOTA = 8;
+    const NEWS_QUOTA = 12;
+
+    const youtubeTop = items.filter(i => i.platform === "youtube").slice(0, YT_QUOTA);
+    const newsTop = items.filter(i => i.platform === "news").slice(0, NEWS_QUOTA);
+
+    let picked = [...youtubeTop, ...newsTop];
+
+    // Fill remaining slots with highest-scoring leftovers (any platform)
+    if (picked.length < 20) {
+      const pickedUrls = new Set(picked.map(i => i.sourceUrl));
+      const leftovers = items.filter(i => !pickedUrls.has(i.sourceUrl));
+      picked = [...picked, ...leftovers].slice(0, 20);
+    }
+
+    items = picked;
+
+    // ✅ Log final mix being ingested
+    const finalCounts = items.reduce((a, it) => {
+      const p = (it.platform || "unknown").toLowerCase();
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("✅ FINAL platformCounts in top 20 being ingested:", finalCounts);
+
+    // Optional: peek at the very top item
+    console.log("🏆 top #1 item after scoring:", {
+      platform: items[0]?.platform,
+      trendScore: items[0]?.trendScore,
+      sourceUrl: items[0]?.sourceUrl,
+      title: items[0]?.topicTitle,
+    });
+
+    
 
     if (!items.length) throw new Error("No items collected from requested platforms");
 

@@ -1,19 +1,16 @@
-export function normalizeTrendItem(x) {
-  const platform = String(x?.platform || "").toLowerCase().trim();
-  const topicTitle = String(x?.topicTitle || "").trim();
-  const sourceUrl = String(x?.sourceUrl || "").trim();
+export function normalizeTrendItem(raw) {
+  const platform =
+    (raw.platform || raw.source || raw.provider || "").toLowerCase().trim();
 
   return {
-    platform: "news",
-    topicTitle,
-    topicSummary: String(x?.topicSummary || ""),
-    queryUsed: String(x?.queryUsed || ""),
-    sourceUrl,
-    publishedAt: x?.publishedAt || null,
-    author: String(x?.author || ""),
-    metrics: x?.metrics || {},
-    clusterId: x?.clusterId || null,
-    trendScore: Number(x?.trendScore ?? 0),
-    riskScore: Number(x?.riskScore ?? 0),
+    platform: platform || "unknown",  // ✅ do not default to news
+    topicTitle: raw.topicTitle || raw.title || raw.headline || "",
+    topicSummary: raw.topicSummary || raw.summary || raw.description || "",
+    sourceUrl: raw.sourceUrl || raw.url || raw.link || "",
+    publishedAt: raw.publishedAt || raw.pubDate || raw.published || null,
+    author: raw.author || raw.channelTitle || raw.sourceName || "",
+    metrics: raw.metrics || {},
+    clusterId: raw.clusterId || null,
+    riskScore: raw.riskScore ?? null,
   };
 }
