@@ -135,6 +135,24 @@ app.post("/scan", requireAuth, async (req, res) => {
     }, {});
     console.log("📊 platformCounts BEFORE dedupe:", platformCounts);
 
+    items = items.map((it) => {
+      // Normalize platform label
+      const platform = (it.platform || it.source || it.provider || "").toLowerCase().trim();
+
+      // Ensure a usable URL field
+      const url =
+        it.sourceUrl ||
+        it.url ||
+        it.link ||
+        (it.videoId ? `https://www.youtube.com/watch?v=${it.videoId}` : "");
+
+      return {
+        ...it,
+        platform,
+        sourceUrl: url,
+      };
+    });
+
 
     // dedupe by platform + sourceUrl
     const seen = new Set();
