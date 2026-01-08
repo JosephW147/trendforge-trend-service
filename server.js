@@ -4,7 +4,6 @@ import cors from "cors";
 
 import { collectYouTubeTrends } from "./youtubeCollector.js";
 import { collectYouTubeWatchlist } from "./youtubeWatchlistCollector.js";
-import { collectYouTubeWatchlist } from "./youtubeWatchlistCollector.js";
 import { collectGdelt } from "./collectors/gdelt.js";
 import { collectRss } from "./collectors/rss.js";
 import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
