@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 
 import { collectYouTubeTrends } from "./youtubeCollector.js";
+import { collectYouTubeWatchlist } from "./youtubeWatchlistCollector.js";
+import { collectYouTubeWatchlist } from "./youtubeWatchlistCollector.js";
 import { collectGdelt } from "./collectors/gdelt.js";
 import { collectRss } from "./collectors/rss.js";
 import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
@@ -143,6 +145,13 @@ app.post("/scan", requireAuth, async (req, res) => {
     nicheName,
     platforms = ["youtube"],
     region = "Global",
+    // Optional watchlist:
+    // {
+    //   channels: [{ label, channelId, enabled, frequency }],
+    //   keywords: [{ label, query, enabled, frequency }],
+    //   frequency: "hourly" | "daily" (filter which to run)
+    // }
+    watchlist,
   } = req.body || {};
 
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
@@ -170,6 +179,20 @@ app.post("/scan", requireAuth, async (req, res) => {
       console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
       console.log("🎥 ytItems sample (raw):", ytItems?.[0]);
       rawItems.push(...(ytItems || []));
+
+      // Optional: watchlist expansion
+      if (watchlist && (watchlist.channels?.length || watchlist.keywords?.length)) {
+        console.log("▶ running youtube watchlist collector");
+        const wlItems = await collectYouTubeWatchlist({
+          watchlist,
+          region,
+          windowHours: watchlist?.windowHours || 72,
+          maxPerChannel: watchlist?.maxPerChannel || 10,
+          maxPerKeyword: watchlist?.maxPerKeyword || 10,
+        });
+        console.log("📌 watchlist items raw count:", wlItems?.length ?? 0);
+        rawItems.push(...(wlItems || []));
+      }
     }
 
     if (requested.includes("news")) {
