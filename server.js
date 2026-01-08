@@ -64,6 +64,71 @@ async function postToBase44(url, payload) {
     return text;
   }
 }
+// ---- Base44 POST helper with backoff -----
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Retry ONLY when Base44 says rate-limited
+async function postToBase44WithBackoff(url, payload, opts = {}) {
+  const {
+    retries = 7,
+    baseDelayMs = 800,
+    maxDelayMs = 12_000,
+  } = opts;
+
+  let lastErr;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-trendforge-secret": INGEST_SECRET,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const text = await resp.text();
+
+      const isRateLimited =
+        resp.status === 429 ||
+        text.toLowerCase().includes("rate limit");
+
+      if (resp.ok) {
+        try {
+          return JSON.parse(text);
+        } catch {
+          return text;
+        }
+      }
+
+      if (isRateLimited && attempt < retries) {
+        const jitter = Math.floor(Math.random() * 250);
+        const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt)) + jitter;
+        console.log(`⏳ Base44 rate-limited. Retry in ${delay}ms (attempt ${attempt + 1}/${retries})`);
+        await sleep(delay);
+        continue;
+      }
+
+      // Non-rate-limit error or out of retries
+      throw new Error(`Base44 call failed ${resp.status}: ${text}`);
+    } catch (e) {
+      lastErr = e;
+      // Retry network errors too (rare)
+      if (attempt < retries) {
+        const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
+        console.log(`⏳ Base44 network/error retry in ${delay}ms (attempt ${attempt + 1}/${retries})`);
+        await sleep(delay);
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw lastErr || new Error("Base44 call failed (unknown)");
+}
 
 // ✅ Normalize requested platforms (treat legacy socials as "news" if they appear)
 function normalizeRequestedPlatforms(input = []) {
@@ -293,6 +358,9 @@ app.post("/scan", requireAuth, async (req, res) => {
       items: storeItems,
     });
     console.log("✅ Base44 TrendItems ingest response:", ingestResp);
+    // Give Base44 a brief breather after a large ingest to reduce throttling
+    await sleep(1200);
+
 
     const storeCounts = storeItems.reduce((a, it) => {
       const p = safePlatform(it.platform);
@@ -303,13 +371,20 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     // 9) Build TrendTopics in Base44 from stored TrendItems
     console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
-    try {
-      const topicsResp = await postToBase44(BASE44_BUILD_TOPICS_URL, { trendRunId });
-      console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
-    } catch (e) {
-      console.error("❌ Base44 buildTrendTopicsFromRun failed:", e?.message || e);
-    }
-  } catch (err) {
+try {
+  const topicsResp = await postToBase44WithBackoff(
+    BASE44_BUILD_TOPICS_URL,
+    { trendRunId, projectId }, // include projectId (harmless if ignored)
+    { retries: 7, baseDelayMs: 900, maxDelayMs: 12_000 }
+  );
+  console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
+} catch (e) {
+  console.error("❌ Base44 buildTrendTopicsFromRun failed (after retries):", e?.message || e);
+
+  // Optional: mark a warning somewhere (do not fail entire run)
+  // You could call BASE44_ERROR_URL with a non-fatal warning if you want
+}
+ } catch (err) {
     console.error("❌ Scan pipeline failed:", err?.message || err);
 
     // Best-effort error callback to Base44
