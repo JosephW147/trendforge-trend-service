@@ -217,6 +217,12 @@ app.post("/scan", requireAuth, async (req, res) => {
     // }
     watchlist,
   } = req.body || {};
+  
+  // 🔍 DEBUG WATCHLIST CONTENT
+  console.log("📋 watchlist received:", !!watchlist);
+  console.log("watchlist.channels count:", watchlist?.channels?.length || 0);
+  console.log("watchlist.keywords count:", watchlist?.keywords?.length || 0);
+
 
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
   if (!projectId) return res.status(400).send("Missing projectId");
