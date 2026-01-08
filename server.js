@@ -8,14 +8,14 @@ import { collectRss } from "./collectors/rss.js";
 import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
 
 import { normalizeTrendItem } from "./normalize/trendItem.js";
-import { scoreItem } from "./scoring/score.js";
+import { scoreItemsComparable } from "./scoring/score.js";
+import { fetchGoogleTrendsSignal } from "./collectors/googleTrends.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // Base44 function to compute topics from TrendItems already stored for a TrendRun
-// (You said you have buildTrendTopicsFromRun, not ingestTrendTopics)
 const BASE44_BUILD_TOPICS_URL =
   process.env.BASE44_BUILD_TOPICS_URL ||
   "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendTopicsFromRun";
@@ -84,16 +84,50 @@ function normalizeRequestedPlatforms(input = []) {
   ];
   if (legacyToNews.some((p) => set.has(p))) supported.add("news");
 
-  // default
   if (supported.size === 0) supported.add("youtube");
   return [...supported];
+}
+
+function safePlatform(raw) {
+  return String(raw || "unknown").toLowerCase().trim();
+}
+
+function safeUrlFrom(raw, normalized) {
+  return (
+    normalized.sourceUrl ||
+    normalized.url ||
+    normalized.link ||
+    raw.sourceUrl ||
+    raw.url ||
+    raw.link ||
+    (raw.videoId ? `https://www.youtube.com/watch?v=${raw.videoId}` : "")
+  );
+}
+
+function pickTrendsQuery(item) {
+  // simple heuristic: title trimmed
+  const t = String(item.topicTitle || "").trim();
+  if (!t) return "";
+  return t.length > 80 ? t.slice(0, 80) : t;
+}
+
+function dedupeByPlatformAndUrl(items) {
+  const seen = new Set();
+  return items.filter((it) => {
+    const p = safePlatform(it.platform);
+    const u = String(it.sourceUrl || "").trim();
+    if (!u) return false;
+    const key = `${p}::${u}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // ---- Health ----
 app.get("/", (req, res) =>
   res.status(200).send("TrendForge Trend Service is running ✅")
 );
-
 app.get("/health", (req, res) =>
   res.status(200).json({ ok: true, service: "trendforge-trend-service" })
 );
@@ -133,7 +167,6 @@ app.post("/scan", requireAuth, async (req, res) => {
         region,
         maxResults: 15,
       });
-
       console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
       console.log("🎥 ytItems sample (raw):", ytItems?.[0]);
       rawItems.push(...(ytItems || []));
@@ -141,118 +174,96 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     if (requested.includes("news")) {
       console.log("▶ running news collectors (GDELT + RSS)");
-
       const gdeltItems = await collectGdelt({ nicheName, max: 25 });
       const rssItems = await collectRss({
         feeds: DEFAULT_RSS_FEEDS,
         nicheName,
         maxPerFeed: 6,
       });
-
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
     }
 
-    // 2) Normalize + score (do NOT slice yet)
-    let items = rawItems
-      .map((raw) => {
-        const originalPlatform =
-          (raw.platform || raw.source || raw.provider || "").toLowerCase().trim();
+    // 2) Normalize (NO scoring yet)
+    let items = rawItems.map((raw) => {
+      const originalPlatform = safePlatform(raw.platform || raw.source || raw.provider);
+      const normalized = normalizeTrendItem(raw);
 
-        const normalized = normalizeTrendItem(raw);
+      const platform = safePlatform(normalized.platform || originalPlatform || "unknown");
+      const sourceUrl = safeUrlFrom(raw, normalized);
 
-        // Keep collector platform if normalization loses it
-        const platform = (normalized.platform || originalPlatform || "unknown")
-          .toLowerCase()
-          .trim();
-
-        // Ensure a usable URL
-        const sourceUrl =
-          normalized.sourceUrl ||
-          normalized.url ||
-          normalized.link ||
-          raw.sourceUrl ||
-          raw.url ||
-          raw.link ||
-          (raw.videoId ? `https://www.youtube.com/watch?v=${raw.videoId}` : "");
-
-        return {
-          ...normalized,
-          platform,
-          sourceUrl,
-        };
-      })
-      .map((it) => ({
-        ...it,
-        // scoreItem expects item fields incl publishedAt/platform/metrics possibly
-        trendScore: scoreItem(it),
-      }));
+      return { ...normalized, platform, sourceUrl };
+    });
 
     console.log("🧪 normalized items count:", items.length);
     console.log("🧪 normalized sample:", items[0]);
 
     const platformCountsBefore = items.reduce((a, it) => {
-      const p = (it.platform || "unknown").toLowerCase();
+      const p = safePlatform(it.platform);
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
     console.log("📊 platformCounts BEFORE dedupe:", platformCountsBefore);
 
-    // 3) Dedupe by platform + sourceUrl
-    const seen = new Set();
-    items = items.filter((it) => {
-      const p = (it.platform || "unknown").toLowerCase().trim();
-      const u = (it.sourceUrl || "").trim();
-      if (!u) return false;
-
-      const key = `${p}::${u}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    // 3) Dedupe BEFORE scoring/trends
+    items = dedupeByPlatformAndUrl(items);
 
     const platformCountsAfter = items.reduce((a, it) => {
-      const p = (it.platform || "unknown").toLowerCase();
+      const p = safePlatform(it.platform);
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
     console.log("📊 platformCounts AFTER dedupe:", platformCountsAfter);
 
-    // 4) Sort by score
+    // 4) Optional: Google Trends on a small subset.
+    // IMPORTANT: pick candidates deterministically.
+    // Since we don’t have comparable trendScore yet, use recency as a rough prefilter:
+    // scoreItemsComparable will later incorporate googleTrends.score01.
+    const TRENDS_ENABLED = process.env.GOOGLE_TRENDS_ENABLED === "true";
+    if (TRENDS_ENABLED) {
+      // pre-pick the newest items (fast + more relevant)
+      const candidates = items
+        .slice()
+        .sort((a, b) => {
+          const ta = new Date(a.publishedAt || 0).getTime();
+          const tb = new Date(b.publishedAt || 0).getTime();
+          return (tb || 0) - (ta || 0);
+        })
+        .slice(0, 10);
+
+      await Promise.allSettled(
+        candidates.map(async (it) => {
+          const query = pickTrendsQuery(it);
+          if (!query) return;
+          const gt = await fetchGoogleTrendsSignal({
+            query,
+            geo: "",
+            timeRange: "now 7-d",
+          });
+          it.googleTrends = gt;
+        })
+      );
+    }
+
+    // 5) Comparable scoring (cross-platform)
+    scoreItemsComparable(items);
+
+    // 6) Sort by comparable score
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
 
     const topCounts = items.slice(0, 20).reduce((a, it) => {
-      const p = (it.platform || "unknown").toLowerCase();
+      const p = safePlatform(it.platform);
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
     console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
 
-    // 5) STORE pool (important for Base44 topic clustering)
+    // 7) STORE pool (important for Base44 topic building)
     const MAX_STORE = 120;
     const storeItems = items.slice(0, MAX_STORE);
 
-    // Optional: show mix for UI debugging (not used for ingest)
-    const FINAL_LIMIT = 20;
-    const YT_QUOTA = 8;
-    const NEWS_QUOTA = 12;
-
-    const youtubeTop = storeItems.filter((i) => i.platform === "youtube").slice(0, YT_QUOTA);
-    const newsTop = storeItems.filter((i) => i.platform === "news").slice(0, NEWS_QUOTA);
-
-    let finalItems = [...youtubeTop, ...newsTop];
-
-    if (finalItems.length < FINAL_LIMIT) {
-      const pickedUrls = new Set(finalItems.map((i) => i.sourceUrl));
-      const leftovers = storeItems.filter((i) => !pickedUrls.has(i.sourceUrl));
-      finalItems = [...finalItems, ...leftovers].slice(0, FINAL_LIMIT);
-    } else {
-      finalItems = finalItems.slice(0, FINAL_LIMIT);
-    }
-
     console.log("✅ STORE TrendItems count:", storeItems.length);
-    console.log("✅ SHOW TrendItems count:", finalItems.length);
 
-    // 6) Ingest TrendItems (STORE pool)
+    // 8) Ingest TrendItems (STORE pool)
     console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
     const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
       trendRunId,
@@ -262,13 +273,13 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("✅ Base44 TrendItems ingest response:", ingestResp);
 
     const storeCounts = storeItems.reduce((a, it) => {
-      const p = (it.platform || "unknown").toLowerCase();
+      const p = safePlatform(it.platform);
       a[p] = (a[p] || 0) + 1;
       return a;
     }, {});
     console.log("📦 STORE platformCounts:", storeCounts);
 
-    // 7) Build TrendTopics in Base44 from stored TrendItems
+    // 9) Build TrendTopics in Base44 from stored TrendItems
     console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
     try {
       const topicsResp = await postToBase44(BASE44_BUILD_TOPICS_URL, { trendRunId });
@@ -299,4 +310,6 @@ app.post("/scan", requireAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`TrendForge Trend Service running on port ${PORT}`));
+app.listen(PORT, () =>
+  console.log(`TrendForge Trend Service running on port ${PORT}`)
+);
