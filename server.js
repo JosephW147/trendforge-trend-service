@@ -240,28 +240,34 @@ app.post("/scan", requireAuth, async (req, res) => {
     let rawItems = [];
 
     if (requested.includes("youtube")) {
-      console.log("▶ running youtube collector");
-      const ytItems = await collectYouTubeTrends({
-        nicheName,
-        region,
-        maxResults: 15,
-      });
-      console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
-      console.log("🎥 ytItems sample (raw):", ytItems?.[0]);
-      rawItems.push(...(ytItems || []));
-
-      // Optional: watchlist expansion
-      if (watchlist && (watchlist.channels?.length || watchlist.keywords?.length)) {
-        console.log("▶ running youtube watchlist collector");
-        const wlItems = await collectYouTubeWatchlist({
-          watchlist,
+      try {
+        console.log("▶ running youtube collector");
+        const ytItems = await collectYouTubeTrends({
+          nicheName,
           region,
-          windowHours: watchlist?.windowHours || 72,
-          maxPerChannel: watchlist?.maxPerChannel || 10,
-          maxPerKeyword: watchlist?.maxPerKeyword || 10,
+          maxResults: 10, // 🔽 reduce to save quota
         });
-        console.log("📌 watchlist items raw count:", wlItems?.length ?? 0);
-        rawItems.push(...(wlItems || []));
+        console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
+        rawItems.push(...(ytItems || []));
+
+        if (watchlist && (watchlist.channels?.length || watchlist.keywords?.length)) {
+          try {
+            console.log("▶ running youtube watchlist collector");
+            const wlItems = await collectYouTubeWatchlist({
+              watchlist,
+              region,
+              windowHours: watchlist?.windowHours || 72,
+              maxPerChannel: Math.min(watchlist?.maxPerChannel || 10, 5), // 🔽 reduce
+              maxPerKeyword: Math.min(watchlist?.maxPerKeyword || 10, 5), // 🔽 reduce
+            });
+            console.log("📌 watchlist items raw count:", wlItems?.length ?? 0);
+            rawItems.push(...(wlItems || []));
+          } catch (e) {
+            console.error("⚠️ YouTube watchlist collector failed (continuing):", e?.message || e);
+          }
+        }
+      } catch (e) {
+        console.error("⚠️ YouTube collector failed (continuing with other platforms):", e?.message || e);
       }
     }
 
