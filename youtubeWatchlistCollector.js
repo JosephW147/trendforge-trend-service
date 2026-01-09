@@ -6,7 +6,7 @@ const YT_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
 const YT_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos";
 
 // ----------------------
-// In-memory cache (per Render instance)
+// Simple in-memory cache (per Render instance)
 // ----------------------
 const _cache = new Map();
 
@@ -24,9 +24,9 @@ function cacheSet(key, value, ttlMs) {
   _cache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
-// TTLs (tune later)
-const TTL_SEARCH_MS = 15 * 60 * 1000; // 15 min
-const TTL_VIDEOS_MS = 15 * 60 * 1000; // 15 min
+// Cache TTLs (tune later)
+const TTL_SEARCH_MS = 10 * 60 * 1000; // 10 min
+const TTL_VIDEOS_MS = 10 * 60 * 1000; // 10 min
 
 function isoHoursAgo(hours) {
   const d = new Date(Date.now() - hours * 60 * 60 * 1000);
@@ -43,24 +43,21 @@ function clamp01(x) {
 }
 
 function computeVelocity01({ views, ageHours }) {
-  // Simple views/hour scaled with log so huge channels don't always dominate.
   const vph = views / Math.max(1, ageHours);
-  return clamp01(Math.log10(vph + 1) / 6); // ~1 at ~1,000,000 vph
+  return clamp01(Math.log10(vph + 1) / 6);
 }
 
 function computeEngagement01({ likes, comments, views }) {
   const denom = Math.max(1, views);
   const likeRate = likes / denom;
   const commentRate = comments / denom;
-  // Typical like rates are < 0.1; comment rates are much smaller.
   return clamp01(likeRate * 4 + commentRate * 20);
 }
 
 function computeTrendScore({ views, likes, comments, ageHours }) {
-  // A more stable heuristic than the default one: focus on velocity + engagement.
   const v01 = computeVelocity01({ views, ageHours });
   const e01 = computeEngagement01({ likes, comments, views });
-  const recency = clamp01(1 - ageHours / 72); // 0 after 72h
+  const recency = clamp01(1 - ageHours / 72);
   return Math.round((v01 * 60 + e01 * 30 + recency * 10) * 100) / 100;
 }
 
@@ -70,7 +67,6 @@ function computeTrendScore({ views, likes, comments, ageHours }) {
 function looksLikeQuotaExceeded(status, text) {
   if (status !== 403) return false;
   const s = String(text || "").toLowerCase();
-  // YouTube often includes "quotaExceeded" reason and/or "exceeded your quota"
   return s.includes("quota") && (s.includes("quotaexceeded") || s.includes("exceeded your"));
 }
 
@@ -80,68 +76,16 @@ async function fetchText(url) {
   return { resp, text };
 }
 
-// ----------------------
-// API calls (with caching + quota handling)
-// ----------------------
-async function ytSearch(params, apiKey, cacheKey) {
-  const cached = cacheGet(cacheKey);
-  if (cached) {
-    // Optional log; comment out if too chatty
-    // console.log("🧠 [YT cache hit] search.list", cacheKey);
-    return cached;
-  }
-
-  const searchParams = new URLSearchParams({ ...params, key: apiKey });
-  const { resp, text } = await fetchText(`${YT_SEARCH_URL}?${searchParams.toString()}`);
-
-  if (!resp.ok) {
-    if (looksLikeQuotaExceeded(resp.status, text)) {
-      const err = new Error(`YT_QUOTA_EXCEEDED: search.list ${resp.status}`);
-      err.code = "YT_QUOTA_EXCEEDED";
-      err.status = resp.status;
-      err.body = text;
-      throw err;
-    }
-    throw new Error(`YouTube search failed ${resp.status}: ${text}`);
-  }
-
-  const json = JSON.parse(text);
-  cacheSet(cacheKey, json, TTL_SEARCH_MS);
-  return json;
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
-async function ytVideos(ids, apiKey, cacheKey) {
-  if (!ids.length) return { items: [] };
-
-  const cached = cacheGet(cacheKey);
-  if (cached) {
-    // Optional log; comment out if too chatty
-    // console.log("🧠 [YT cache hit] videos.list", cacheKey);
-    return cached;
-  }
-
-  const videosParams = new URLSearchParams({
-    part: "snippet,statistics,contentDetails",
-    id: ids.join(","),
-    key: apiKey,
-  });
-
-  const { resp, text } = await fetchText(`${YT_VIDEOS_URL}?${videosParams.toString()}`);
-
-  if (!resp.ok) {
-    if (looksLikeQuotaExceeded(resp.status, text)) {
-      const err = new Error(`YT_QUOTA_EXCEEDED: videos.list ${resp.status}`);
-      err.code = "YT_QUOTA_EXCEEDED";
-      err.status = resp.status;
-      err.body = text;
-      throw err;
-    }
-    throw new Error(`YouTube videos.list failed ${resp.status}: ${text}`);
-  }
-
-  const json = JSON.parse(text);
-  cacheSet(cacheKey, json, TTL_VIDEOS_MS);
-  return json;
+function shortKeyPart(s, maxLen = 80) {
+  const x = String(s ?? "");
+  if (x.length <= maxLen) return x;
+  return x.slice(0, maxLen) + `…len${x.length}`;
 }
 
 function normalizeWatchlist(watchlist) {
@@ -157,11 +101,7 @@ function normalizeWatchlist(watchlist) {
     .filter((c) => !freqFilter || String(c.frequency || "").toLowerCase() === freqFilter);
 
   const kw = keywords
-    .filter((k) => {
-      // support both {query} and {queryText} in case some rows use your seed format
-      const q = typeof k?.query === "string" ? k.query : (typeof k?.queryText === "string" ? k.queryText : "");
-      return q && q.trim();
-    })
+    .filter((k) => k && typeof k.query === "string" && k.query.trim())
     .filter((k) => k.enabled !== false)
     .filter((k) => !freqFilter || String(k.frequency || "").toLowerCase() === freqFilter);
 
@@ -198,7 +138,7 @@ function mapVideoToTrendItem(v, meta) {
       viewsPerHour: Math.round((views / Math.max(1, ageHours)) * 100) / 100,
       likeRate: Math.round((likes / Math.max(1, views)) * 1e6) / 1e6,
       commentRate: Math.round((comments / Math.max(1, views)) * 1e6) / 1e6,
-      sourceType: meta.sourceType, // watchlist_channel | watchlist_keyword
+      sourceType: meta.sourceType,
       sourceLabel: meta.sourceLabel || "",
       region: meta.region || "Global",
     },
@@ -208,11 +148,64 @@ function mapVideoToTrendItem(v, meta) {
   };
 }
 
+async function ytSearchCached(params, apiKey, cacheKey, onQuota) {
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    console.log("🧠 [YT cache hit] search.list", { key: cacheKey });
+    return cached;
+  }
+
+  const searchParams = new URLSearchParams({ ...params, key: apiKey });
+  const url = `${YT_SEARCH_URL}?${searchParams.toString()}`;
+  const { resp, text } = await fetchText(url);
+
+  if (!resp.ok) {
+    if (looksLikeQuotaExceeded(resp.status, text)) {
+      if (typeof onQuota === "function") onQuota();
+      return null; // caller decides how to proceed
+    }
+    throw new Error(`YouTube search failed ${resp.status}: ${text}`);
+  }
+
+  const json = JSON.parse(text);
+  cacheSet(cacheKey, json, TTL_SEARCH_MS);
+  return json;
+}
+
+async function ytVideosCached(ids, apiKey, cacheKey, onQuota) {
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    console.log("🧠 [YT cache hit] videos.list", { count: ids.length });
+    return cached;
+  }
+
+  const videosParams = new URLSearchParams({
+    part: "snippet,statistics,contentDetails",
+    id: ids.join(","),
+    key: apiKey,
+  });
+
+  const url = `${YT_VIDEOS_URL}?${videosParams.toString()}`;
+  const { resp, text } = await fetchText(url);
+
+  if (!resp.ok) {
+    if (looksLikeQuotaExceeded(resp.status, text)) {
+      if (typeof onQuota === "function") onQuota();
+      return null;
+    }
+    throw new Error(`YouTube videos.list failed ${resp.status}: ${text}`);
+  }
+
+  const json = JSON.parse(text);
+  cacheSet(cacheKey, json, TTL_VIDEOS_MS);
+  return json;
+}
+
 export async function collectYouTubeWatchlist({
   watchlist,
   region = "Global",
-  regionCode = "", // ISO 3166-1 alpha-2 if you want region filtering
-  relevanceLanguage = "", // e.g., en
+  regionCode = "",
+  relevanceLanguage = "",
   windowHours = 72,
   maxPerChannel = 10,
   maxPerKeyword = 10,
@@ -225,148 +218,129 @@ export async function collectYouTubeWatchlist({
 
   const publishedAfter = isoHoursAgo(windowHours);
 
-  // --- 1) Gather candidate IDs ---
   const ids = new Set();
-  const idMeta = new Map(); // videoId -> meta
+  const idMeta = new Map();
 
-  let quotaTripped = false;
-
+  // ----------------------
   // A) channel uploads
+  // ----------------------
   for (const c of wl.channels) {
-    if (quotaTripped) break;
-
     const channelId = c.channelId.trim();
-    const maxResults = Math.min(maxPerChannel, 25);
+    const cap = Math.min(maxPerChannel, 25);
 
-    const params = {
-      part: "snippet",
-      type: "video",
-      channelId,
-      order: "date",
-      maxResults: String(maxResults),
-      publishedAfter,
-      ...(regionCode ? { regionCode } : {}),
-      ...(relevanceLanguage ? { relevanceLanguage } : {}),
-    };
+    const cacheKey = `yt:wl:search:channel=${channelId}:cap=${cap}:after=${publishedAfter}:rc=${shortKeyPart(
+      regionCode
+    )}:lang=${shortKeyPart(relevanceLanguage)}`;
 
-    const cacheKey = `yt:wl:search:channel:${channelId}:max=${maxResults}:after=${publishedAfter}:rc=${regionCode || "-"}:lang=${relevanceLanguage || "-"}`;
+    const res = await ytSearchCached(
+      {
+        part: "snippet",
+        type: "video",
+        channelId,
+        order: "date",
+        maxResults: String(cap),
+        publishedAfter,
+        ...(regionCode ? { regionCode } : {}),
+        ...(relevanceLanguage ? { relevanceLanguage } : {}),
+      },
+      apiKey,
+      cacheKey,
+      () => console.warn(`⚠️ [YT quota exceeded] search.list (watchlist channel ${channelId}) — skipping channel`)
+    );
 
-    try {
-      const res = await ytSearch(params, apiKey, cacheKey);
+    if (!res) continue;
 
-      for (const it of res.items || []) {
-        const vid = it?.id?.videoId;
-        if (!vid) continue;
-        if (!ids.has(vid)) ids.add(vid);
-        if (!idMeta.has(vid)) {
-          idMeta.set(vid, {
-            sourceType: "watchlist_channel",
-            sourceLabel: c.label || c.channelId,
-            queryUsed: `channel:${c.channelId}`,
-            region,
-          });
-        }
+    for (const it of res.items || []) {
+      const vid = it?.id?.videoId;
+      if (!vid) continue;
+      if (!ids.has(vid)) ids.add(vid);
+      if (!idMeta.has(vid)) {
+        idMeta.set(vid, {
+          sourceType: "watchlist_channel",
+          sourceLabel: c.label || c.channelId,
+          queryUsed: `channel:${c.channelId}`,
+          region,
+        });
       }
-    } catch (e) {
-      if (e?.code === "YT_QUOTA_EXCEEDED") {
-        quotaTripped = true;
-        console.warn("⚠️ YouTube quota exceeded during watchlist channel search. Returning partial results.");
-        break;
-      }
-      throw e;
     }
   }
 
+  // ----------------------
   // B) keyword searches
+  // ----------------------
   for (const k of wl.keywords) {
-    if (quotaTripped) break;
+    const q = k.query.trim();
+    const cap = Math.min(maxPerKeyword, 25);
 
-    // support both {query} and {queryText}
-    const q = (typeof k?.query === "string" ? k.query : (typeof k?.queryText === "string" ? k.queryText : "")).trim();
-    if (!q) continue;
+    const cacheKey = `yt:wl:search:q=${encodeURIComponent(shortKeyPart(q))}:cap=${cap}:after=${publishedAfter}:rc=${shortKeyPart(
+      regionCode
+    )}:lang=${shortKeyPart(relevanceLanguage)}`;
 
-    const maxResults = Math.min(maxPerKeyword, 25);
+    const res = await ytSearchCached(
+      {
+        part: "snippet",
+        type: "video",
+        q,
+        order: "date",
+        maxResults: String(cap),
+        publishedAfter,
+        ...(regionCode ? { regionCode } : {}),
+        ...(relevanceLanguage ? { relevanceLanguage } : {}),
+      },
+      apiKey,
+      cacheKey,
+      () => console.warn(`⚠️ [YT quota exceeded] search.list (watchlist keyword "${q}") — skipping keyword`)
+    );
 
-    const params = {
-      part: "snippet",
-      type: "video",
-      q,
-      order: "date",
-      maxResults: String(maxResults),
-      publishedAfter,
-      ...(regionCode ? { regionCode } : {}),
-      ...(relevanceLanguage ? { relevanceLanguage } : {}),
-    };
+    if (!res) continue;
 
-    const cacheKey = `yt:wl:search:keyword:${encodeURIComponent(q)}:max=${maxResults}:after=${publishedAfter}:rc=${regionCode || "-"}:lang=${relevanceLanguage || "-"}`;
-
-    try {
-      const res = await ytSearch(params, apiKey, cacheKey);
-
-      for (const it of res.items || []) {
-        const vid = it?.id?.videoId;
-        if (!vid) continue;
-        if (!ids.has(vid)) ids.add(vid);
-        if (!idMeta.has(vid)) {
-          idMeta.set(vid, {
-            sourceType: "watchlist_keyword",
-            sourceLabel: k.label || q,
-            queryUsed: q,
-            region,
-          });
-        }
+    for (const it of res.items || []) {
+      const vid = it?.id?.videoId;
+      if (!vid) continue;
+      if (!ids.has(vid)) ids.add(vid);
+      if (!idMeta.has(vid)) {
+        idMeta.set(vid, {
+          sourceType: "watchlist_keyword",
+          sourceLabel: k.label || k.query,
+          queryUsed: k.query,
+          region,
+        });
       }
-    } catch (e) {
-      if (e?.code === "YT_QUOTA_EXCEEDED") {
-        quotaTripped = true;
-        console.warn("⚠️ YouTube quota exceeded during watchlist keyword search. Returning partial results.");
-        break;
-      }
-      throw e;
     }
   }
 
   const idList = [...ids];
   if (!idList.length) return [];
 
-  // --- 2) Fetch stats in chunks (YouTube allows up to 50 IDs per call) ---
+  // ----------------------
+  // 2) Fetch stats in chunks (up to 50 IDs per call)
+  // ----------------------
   const out = [];
-  for (let i = 0; i < idList.length; i += 50) {
-    if (quotaTripped) break;
 
-    const chunk = idList.slice(i, i + 50);
-    const cacheKey = `yt:wl:videos:${chunk.join(",")}`;
+  for (const chunk of chunkArray(idList, 50)) {
+    const vidsKey = `yt:wl:videos:ids=${chunk.join(",")}`;
 
-    try {
-      const vids = await ytVideos(chunk, apiKey, cacheKey);
+    const vids = await ytVideosCached(
+      chunk,
+      apiKey,
+      vidsKey,
+      () => console.warn("⚠️ [YT quota exceeded] videos.list (watchlist) — returning partial results")
+    );
 
-      for (const v of vids.items || []) {
-        const meta =
-          idMeta.get(v.id) || {
-            sourceType: "watchlist_unknown",
-            sourceLabel: "watchlist",
-            queryUsed: "",
-            region,
-          };
-        out.push(mapVideoToTrendItem(v, meta));
-      }
-    } catch (e) {
-      if (e?.code === "YT_QUOTA_EXCEEDED") {
-        quotaTripped = true;
-        console.warn("⚠️ YouTube quota exceeded during watchlist videos.list. Returning partial results.");
-        break;
-      }
-      throw e;
+    if (!vids) break;
+
+    for (const v of vids.items || []) {
+      const meta =
+        idMeta.get(v.id) || {
+          sourceType: "watchlist_unknown",
+          sourceLabel: "watchlist",
+          queryUsed: "",
+          region,
+        };
+      out.push(mapVideoToTrendItem(v, meta));
     }
   }
 
-  // Sort best first.
   out.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
-
-  // IMPORTANT: If quota tripped, still return what we have (don’t crash scan)
-  if (quotaTripped) {
-    console.warn("⚠️ Watchlist collector returned partial results due to quota. items:", out.length);
-  }
-
   return out;
 }
