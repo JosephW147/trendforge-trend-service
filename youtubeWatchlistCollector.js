@@ -84,8 +84,10 @@ function chunkArray(arr, size) {
 
 function shortKeyPart(s, maxLen = 80) {
   const x = String(s ?? "");
-  if (x.length <= maxLen) return x;
-  return x.slice(0, maxLen) + `…len${x.length}`;
+  // Truncate by Unicode code points so we never split surrogate pairs (emoji).
+  const cps = Array.from(x);
+  if (cps.length <= maxLen) return x;
+  return cps.slice(0, maxLen).join("") + `…len${cps.length}`;
 }
 
 function normalizeWatchlist(watchlist) {

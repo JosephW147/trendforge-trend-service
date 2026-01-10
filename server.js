@@ -42,6 +42,27 @@ function requireAuth(req, res, next) {
   next();
 }
 
+
+// ---- UTF-8 safety: remove lone surrogate code units (prevents Base44/Python utf-8 errors) ----
+function stripLoneSurrogates(s) {
+  // Any code unit in D800–DFFF is a surrogate. If it appears alone in a JS string,
+  // JSON.stringify will emit \ud83d style escapes which Python cannot encode as UTF-8.
+  return String(s ?? "").replace(/[\uD800-\uDFFF]/g, "");
+}
+
+function deepCleanForUtf8(x) {
+  if (x == null) return x;
+  if (typeof x === "string") return stripLoneSurrogates(x);
+  if (typeof x === "number" || typeof x === "boolean") return x;
+  if (Array.isArray(x)) return x.map(deepCleanForUtf8);
+  if (typeof x === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(x)) out[k] = deepCleanForUtf8(v);
+    return out;
+  }
+  return x;
+}
+
 // ---- Base44 POST helper ----
 async function postToBase44(url, payload) {
   if (!url) throw new Error("postToBase44: missing url");
@@ -52,7 +73,7 @@ async function postToBase44(url, payload) {
       "Content-Type": "application/json",
       "x-trendforge-secret": INGEST_SECRET,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(deepCleanForUtf8(payload)),
   });
 
   const text = await resp.text();
