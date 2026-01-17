@@ -11,6 +11,7 @@ import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItemsComparable } from "./scoring/score.js";
 import { fetchGoogleTrendsSignal } from "./collectors/googleTrends.js";
+import { buildEditorial } from "./editorial/buildEditorial.js";
 
 const app = express();
 app.use(cors());
@@ -218,6 +219,19 @@ app.get("/", (req, res) =>
 app.get("/health", (req, res) =>
   res.status(200).json({ ok: true, service: "trendforge-trend-service" })
 );
+
+// ---- Phase C: editorial (LLM ranker/editor) ----
+// Receives compact candidate topics from Base44 Function and returns strict JSON.
+// Auth: same Bearer token as /scan
+app.post("/editorial", requireAuth, async (req, res) => {
+  try {
+    const out = await buildEditorial(req.body || {});
+    res.status(200).json(out);
+  } catch (e) {
+    console.error("❌ /editorial failed:", e?.message || e);
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 
 // ---- Scan ----
 app.post("/scan", requireAuth, async (req, res) => {

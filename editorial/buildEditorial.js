@@ -1,0 +1,187 @@
+// editorial/buildEditorial.js
+// Phase C: LLM ranker/editor (no topic invention)
+//
+// Input:
+// {
+//   trendRunId, projectId,
+//   minPicks, maxPicks,
+//   channel_profile,
+//   candidate_topics: [...] (max 50)
+// }
+//
+// Output (strict JSON object):
+// {
+//   model,
+//   duplicate_groups: [...],
+//   ranked_topics: [...],
+//   final_picks: [...]
+// }
+
+const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+function clampInt(n, lo, hi) {
+  const x = Number.isFinite(Number(n)) ? Number(n) : lo;
+  return Math.max(lo, Math.min(hi, Math.trunc(x)));
+}
+
+function asArray(x) {
+  return Array.isArray(x) ? x : [];
+}
+
+function stringifyJson(obj) {
+  return JSON.stringify(obj, null, 0);
+}
+
+function buildSystemPrompt() {
+  return (
+    "You are a JSON-only ranker/editor for a trend selection pipeline. " +
+    "You MUST ONLY use the provided candidate_topics and their fields. " +
+    "You MUST NOT invent topics, facts, metrics, or URLs. " +
+    "You MUST output VALID JSON ONLY (no markdown, no commentary). " +
+    "All topic_ids in output must come from candidate_topics[].topicId. " +
+    "All sources_to_cite must be chosen ONLY from that topic's topSourceUrls."
+  );
+}
+
+function buildUserPrompt({ channel_profile, candidate_topics, minPicks, maxPicks }) {
+  // Keep prompt compact + grounded.
+  return (
+    "CHANNEL_PROFILE:\n" + stringifyJson(channel_profile) +
+    "\n\nCANDIDATE_TOPICS (max 50):\n" + stringifyJson(candidate_topics) +
+    `\n\nTASK:\n1) Propose duplicate_groups across candidates for near-duplicates.\n` +
+    `2) Produce ranked_topics across all candidates with short grounded why_trend text using ONLY provided metrics.\n` +
+    `3) Choose final_picks of ${minPicks}-${maxPicks} topics that best fit the channel_profile and are safe.\n` +
+    `4) For each final pick, provide angles: whats_new, why_now, hook, angle_options (2-3), suggested_titles (1-2), sources_to_cite (subset of topSourceUrls).\n\n` +
+    "OUTPUT JSON SCHEMA (exact keys):\n" +
+    stringifyJson({
+      duplicate_groups: [
+        {
+          topic_ids: ["id1", "id2"],
+          canonical_topic_id: "id1",
+          reason: "..."
+        }
+      ],
+      ranked_topics: [
+        {
+          topic_id: "id1",
+          rank: 1,
+          why_trend: "..."
+        }
+      ],
+      final_picks: [
+        {
+          topic_id: "id1",
+          fit_reason: "...",
+          risk_flags: ["..."] ,
+          angles: {
+            whats_new: "...",
+            why_now: "...",
+            hook: "...",
+            angle_options: ["...", "..."],
+            suggested_titles: ["...", "..."],
+            sources_to_cite: ["url1", "url2"]
+          }
+        }
+      ]
+    })
+  );
+}
+
+function safeParseJson(text) {
+  // Some models may wrap JSON; try to extract the first {...} block.
+  const t = String(text || "").trim();
+  try {
+    return JSON.parse(t);
+  } catch {
+    const m = t.match(/\{[\s\S]*\}$/);
+    if (m) return JSON.parse(m[0]);
+    throw new Error("LLM returned non-JSON");
+  }
+}
+
+function validate(out, candidate_topics, minPicks, maxPicks) {
+  if (!out || typeof out !== "object") throw new Error("LLM output is not an object");
+  const ids = new Set(asArray(candidate_topics).map((c) => String(c?.topicId)));
+
+  const finalPicks = asArray(out.final_picks);
+  if (finalPicks.length < minPicks || finalPicks.length > maxPicks) {
+    throw new Error(`final_picks must have ${minPicks}-${maxPicks} items`);
+  }
+
+  // Map allowed URLs per topic
+  const allowedUrls = new Map(
+    asArray(candidate_topics).map((c) => [
+      String(c?.topicId),
+      new Set(asArray(c?.topSourceUrls).map(String))
+    ])
+  );
+
+  // Ensure ids + URLs are grounded
+  for (const p of finalPicks) {
+    const id = String(p?.topic_id || "");
+    if (!ids.has(id)) throw new Error(`Unknown topic_id in final_picks: ${id}`);
+    const cite = asArray(p?.angles?.sources_to_cite);
+    const allowed = allowedUrls.get(id) || new Set();
+    for (const u of cite) {
+      const url = String(u);
+      if (!allowed.has(url)) throw new Error(`sources_to_cite contains URL not allowed for ${id}`);
+    }
+  }
+  return true;
+}
+
+async function callOpenAI({ model, system, user, temperature }) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    throw new Error("OPENAI_API_KEY is not set on the trend service");
+  }
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = json?.error?.message || JSON.stringify(json);
+    throw new Error(`OpenAI API error ${resp.status}: ${msg}`);
+  }
+
+  const content = json?.choices?.[0]?.message?.content;
+  return String(content || "");
+}
+
+export async function buildEditorial(input) {
+  const candidate_topics = asArray(input?.candidate_topics).slice(0, 50);
+  if (candidate_topics.length === 0) throw new Error("candidate_topics is empty");
+
+  const minPicks = clampInt(input?.minPicks ?? 3, 1, 10);
+  const maxPicks = clampInt(input?.maxPicks ?? 5, minPicks, 10);
+  const channel_profile = (input?.channel_profile && typeof input.channel_profile === "object")
+    ? input.channel_profile
+    : { audience: "general", video_length: "60s" };
+
+  const model = String(input?.model || "").trim() || DEFAULT_MODEL;
+  const temperature = Number.isFinite(Number(input?.temperature)) ? Number(input.temperature) : 0.3;
+
+  const system = buildSystemPrompt();
+  const user = buildUserPrompt({ channel_profile, candidate_topics, minPicks, maxPicks });
+
+  const content = await callOpenAI({ model, system, user, temperature });
+  const out = safeParseJson(content);
+  validate(out, candidate_topics, minPicks, maxPicks);
+
+  // Attach model for transparency
+  return { model, ...out };
+}
