@@ -14,7 +14,15 @@
 //   model,
 //   duplicate_groups: [...],
 //   ranked_topics: [...],
-//   final_picks: [...]
+//   final_picks: [
+//     {
+//       topic_id: "...",
+//       trend_likelihood: 0-100,   // ✅ added deterministically in backend
+//       fit_reason: "...",
+//       risk_flags: [...],
+//       angles: {...}
+//     }
+//   ]
 // }
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
@@ -30,6 +38,61 @@ function asArray(x) {
 
 function stringifyJson(obj) {
   return JSON.stringify(obj, null, 0);
+}
+
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function normTo01(x, max) {
+  const n = Number(x);
+  if (!Number.isFinite(n) || !Number.isFinite(Number(max)) || max <= 0) return 0;
+  return clamp01(n / max);
+}
+
+/**
+ * Deterministic score 0-100 indicating likelihood this topic continues trending soon.
+ * Derived ONLY from Phase B metrics present on candidate_topics.
+ *
+ * Expected topic fields (if missing, treated as 0):
+ * - emergingScore (0..~10)
+ * - momentumScore (0..~10)
+ * - freshnessScore (0..1) OR freshness01-like value
+ * - sourceDiversity (0..~5)
+ * - itemsCount or sourceCount (0..~20)
+ */
+function computeTrendLikelihood(topic) {
+  // Normalize (caps are tuning knobs; keep stable once you like the output)
+  const nEmerging = normTo01(topic?.emergingScore, 10);
+  const nMomentum = normTo01(topic?.momentumScore, 10);
+
+  // freshnessScore: if it’s already 0..1, keep it; if it’s >1, normalize softly
+  const rawFresh = Number(topic?.freshnessScore);
+  const nFreshness = Number.isFinite(rawFresh)
+    ? (rawFresh <= 1 ? clamp01(rawFresh) : normTo01(rawFresh, 10))
+    : 0;
+
+  const nDiversity = normTo01(topic?.sourceDiversity, 5);
+
+  const breadthRaw =
+    topic?.itemsCount ??
+    topic?.sourceCount ??
+    topic?.numItems ??
+    topic?.count ??
+    0;
+  const nBreadth = normTo01(breadthRaw, 20);
+
+  // Weighted sum (must stay deterministic)
+  const score01 =
+    0.30 * nMomentum +
+    0.25 * nEmerging +
+    0.20 * nFreshness +
+    0.15 * nDiversity +
+    0.10 * nBreadth;
+
+  return Math.round(clamp01(score01) * 100);
 }
 
 function buildSystemPrompt() {
@@ -191,6 +254,36 @@ async function callOpenAI({ model, system, user, temperature, forceJson = true }
   return String(content || "");
 }
 
+/**
+ * Attach deterministic trend_likelihood to picks and (optionally) ranked_topics.
+ * This is NOT computed by the LLM.
+ */
+function attachTrendLikelihood(out, candidate_topics) {
+  const byId = new Map(
+    asArray(candidate_topics).map((t) => [String(t?.topicId), t])
+  );
+
+  // final_picks: attach trend_likelihood
+  out.final_picks = asArray(out.final_picks).map((p) => {
+    const id = String(p?.topic_id || "");
+    const topic = byId.get(id);
+    const trend_likelihood = computeTrendLikelihood(topic);
+    return { ...p, trend_likelihood };
+  });
+
+  // ranked_topics: optional (nice for debugging / future UI)
+  if (Array.isArray(out.ranked_topics)) {
+    out.ranked_topics = out.ranked_topics.map((r) => {
+      const id = String(r?.topic_id || "");
+      const topic = byId.get(id);
+      const trend_likelihood = computeTrendLikelihood(topic);
+      return { ...r, trend_likelihood };
+    });
+  }
+
+  return out;
+}
+
 export async function buildEditorial(input) {
   const candidate_topics = asArray(input?.candidate_topics).slice(0, 50);
   if (candidate_topics.length === 0) throw new Error("candidate_topics is empty");
@@ -236,6 +329,9 @@ export async function buildEditorial(input) {
   }
 
   validate(out, candidate_topics, minPicks, maxPicks);
+
+  // ✅ Add deterministic trend_likelihood (0–100) AFTER validation
+  out = attachTrendLikelihood(out, candidate_topics);
 
   // Attach model for transparency
   return { model, ...out };
