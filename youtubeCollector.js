@@ -79,7 +79,13 @@ function shortKeyPart(s, maxLen = 80) {
   return cps.slice(0, maxLen).join("") + `…len${cps.length}`;  
 }
 
-export async function collectYouTubeTrends({ nicheName, region = "Global", maxResults = 15 }) {
+export async function collectYouTubeTrends({
+  nicheName,
+  region = "Global",
+  regionCode = "",
+  relevanceLanguage = "",
+  maxResults = 15,
+}) {
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey) throw new Error("YOUTUBE_API_KEY is missing in Render env");
 
@@ -92,6 +98,8 @@ export async function collectYouTubeTrends({ nicheName, region = "Global", maxRe
   // ----------------------
   const searchKey = `yt:search:q=${encodeURIComponent(shortKeyPart(q))}:max=${cappedMax}:after=${publishedAfter}:region=${encodeURIComponent(
     shortKeyPart(region)
+  )}:rc=${encodeURIComponent(shortKeyPart(regionCode || ""))}:lang=${encodeURIComponent(
+    shortKeyPart(relevanceLanguage || "")
   )}`;
 
   let videoIds = [];
@@ -111,6 +119,14 @@ export async function collectYouTubeTrends({ nicheName, region = "Global", maxRe
       publishedAfter,
       key: apiKey,
     });
+
+    // Region targeting (YouTube uses ISO 3166-1 alpha-2 regionCode)
+    if (regionCode && /^[A-Z]{2}$/i.test(regionCode)) {
+      searchParams.set("regionCode", String(regionCode).toUpperCase());
+    }
+    if (relevanceLanguage) {
+      searchParams.set("relevanceLanguage", String(relevanceLanguage));
+    }
 
     const { resp: searchResp, text: searchText } = await fetchText(
       `${YT_SEARCH_URL}?${searchParams.toString()}`

@@ -242,8 +242,10 @@ app.post("/scan", requireAuth, async (req, res) => {
     trendRunId,
     projectId,
     nicheName,
+    niches,
     platforms = ["youtube"],
     region = "Global",
+    regions,
     // Optional watchlist:
     // {
     //   channels: [{ label, channelId, enabled, frequency }],
@@ -252,6 +254,46 @@ app.post("/scan", requireAuth, async (req, res) => {
     // }
     watchlist,
   } = req.body || {};
+
+  // Multi-select support (Base44 can send niches/regions arrays)
+  const nicheList = Array.isArray(niches)
+    ? niches
+    : String(nicheName || "").includes(",")
+    ? String(nicheName || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
+    : [String(nicheName || "General").trim() || "General"];
+
+  const regionList = Array.isArray(regions)
+    ? regions
+    : String(region || "").includes(",")
+    ? String(region || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
+    : [String(region || "Global").trim() || "Global"];
+
+  const uniq = (arr) => {
+    const out = [];
+    const seen = new Set();
+    for (const v of arr || []) {
+      const s = String(v || "").trim();
+      if (!s || seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  };
+
+  const NICHES = uniq(nicheList);
+  const REGIONS = uniq(regionList);
+
+  const regionCodeFrom = (r) => {
+    const s = String(r || "").trim();
+    if (/^[A-Z]{2}$/i.test(s)) return s.toUpperCase();
+    return "";
+  };
   
   // 🔍 DEBUG WATCHLIST CONTENT
   console.log("📋 watchlist received:", !!watchlist);
@@ -276,27 +318,55 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     if (requested.includes("youtube")) {
       try {
-        console.log("▶ running youtube collector");
-        const ytItems = await collectYouTubeTrends({
-          nicheName,
-          region,
-          maxResults: 10, // 🔽 reduce to save quota
-        });
-        console.log("🎥 ytItems raw count:", ytItems?.length ?? 0);
-        rawItems.push(...(ytItems || []));
+        console.log("▶ running youtube collector (multi-niche/region)");
+
+        // Safety caps to protect quota: keep total combos reasonable.
+        const MAX_COMBOS = 8;
+        const combos = [];
+        for (const n of NICHES) {
+          for (const r of REGIONS) {
+            combos.push({ n, r });
+          }
+        }
+
+        const slicedCombos = combos.slice(0, MAX_COMBOS);
+        if (combos.length > slicedCombos.length) {
+          console.log(
+            `⚠️ too many niche/region combos (${combos.length}); capping to ${slicedCombos.length} for quota safety`
+          );
+        }
+
+        for (const { n, r } of slicedCombos) {
+          const regionCode = /^[A-Z]{2}$/i.test(r) ? r.toUpperCase() : "";
+          const ytItems = await collectYouTubeTrends({
+            nicheName: n,
+            region: r,
+            regionCode,
+            maxResults: 10, // 🔽 reduce to save quota
+          });
+          console.log("🎥 ytItems raw count:", ytItems?.length ?? 0, { niche: n, region: r });
+          rawItems.push(...(ytItems || []));
+        }
 
         if (watchlist && (watchlist.channels?.length || watchlist.keywords?.length)) {
           try {
             console.log("▶ running youtube watchlist collector");
-            const wlItems = await collectYouTubeWatchlist({
-              watchlist,
-              region,
+            // Watchlist runs per-region (keywords/channels are user-defined).
+            // Keep it capped for quota safety.
+            const wlRegions = REGIONS.slice(0, 4);
+            for (const r of wlRegions) {
+              const regionCode = /^[A-Z]{2}$/i.test(r) ? r.toUpperCase() : "";
+              const wlItems = await collectYouTubeWatchlist({
+                watchlist,
+                region: r,
+                regionCode,
               windowHours: watchlist?.windowHours || 72,
               maxPerChannel: Math.min(watchlist?.maxPerChannel || 10, 5), // 🔽 reduce
               maxPerKeyword: Math.min(watchlist?.maxPerKeyword || 10, 5), // 🔽 reduce
-            });
-            console.log("📌 watchlist items raw count:", wlItems?.length ?? 0);
-            rawItems.push(...(wlItems || []));
+              });
+              console.log("📌 watchlist items raw count:", wlItems?.length ?? 0, { region: r });
+              rawItems.push(...(wlItems || []));
+            }
           } catch (e) {
             console.error("⚠️ YouTube watchlist collector failed (continuing):", e?.message || e);
           }
@@ -308,10 +378,19 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     if (requested.includes("news")) {
       console.log("▶ running news collectors (GDELT + RSS)");
-      const gdeltItems = await collectGdelt({ nicheName, max: 25 });
+      // Pull GDELT per-niche and per-region so regional filters apply.
+      const gdeltItems = [];
+      const MAX_GDELT_COMBOS = 12;
+      const combos = [];
+      for (const n of NICHES) for (const r of REGIONS) combos.push({ n, r });
+      for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
+        const part = await collectGdelt({ nicheName: n, region: r, max: 25 });
+        gdeltItems.push(...(part || []));
+      }
       const rssItems = await collectRss({
         feeds: DEFAULT_RSS_FEEDS,
-        nicheName,
+        // RSS doesn't support region targeting; include all niches as a single query string.
+        nicheName: NICHES.join(" OR ") || nicheName,
         maxPerFeed: 6,
       });
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
