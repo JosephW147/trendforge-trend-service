@@ -64,6 +64,18 @@ function deepCleanForUtf8(x) {
   }
   return x;
 }
+function buildGoogleNewsRssFeeds(queries, opts = {}) {
+  const { hl = "en-US", gl = "US", ceid = "US:en", limit = 12 } = opts;
+
+  const uniq = (arr) => [...new Set((arr || []).map((x) => String(x || "").trim()).filter(Boolean))];
+
+  return uniq(queries)
+    .slice(0, Math.max(5, Math.min(limit, 12)))
+    .map((q) => {
+      const encoded = encodeURIComponent(q);
+      return `https://news.google.com/rss/search?q=${encoded}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
+    });
+}
 
 // ---- Base44 POST helper ----
 async function postToBase44(url, payload) {
@@ -446,9 +458,12 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
       const m = item?.metrics && typeof item.metrics === "object" ? item.metrics : {};
       const srcC = String(m?.sourceCountry || "").toUpperCase().trim();
       const feedRegion = String(m?.feedRegion || "").toUpperCase().trim();
-      const ok = (srcC && regionCodes.includes(srcC)) || (feedRegion && regionCodes.includes(feedRegion));
+      if (srcC || feedRegion) {
+        const ok =
+          (srcC && regionCodes.includes(srcC)) ||
+          (feedRegion && regionCodes.includes(feedRegion));
       if (!ok) {
-        return { pass: false, score: 0, reasons: ["region_mismatch_or_unknown"] };
+        return { pass: false, reasons: ["region_mismatch"] };
       }
     }
 
@@ -723,9 +738,17 @@ app.post("/scan", requireAuth, async (req, res) => {
       }
             let rssItems = [];
       try {
+        const rssFeeds =
+          STRICT_PROJECT_SCAN && NEWS_QUERIES.length
+            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+            : getRssFeedsForRegions(REGIONS);
+
+        if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
+          console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
+        }
+
         rssItems = await collectRss({
-          feeds: getRssFeedsForRegions(REGIONS),
-          // RSS doesn't support region targeting; include all niches as a single query string.
+          feeds: rssFeeds,
           nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
           maxPerFeed: 6,
         });
@@ -772,7 +795,7 @@ app.post("/scan", requireAuth, async (req, res) => {
       !hasWatchlist;
 
     const STRICT_PROJECT_SCAN = !isGlobalProject;
-    const windowHours = Number(watchlist?.windowHours || 72);
+    const windowHours = Number(watchlist?.windowHours || 24);
 
     if (STRICT_PROJECT_SCAN) {
       const gateItem = buildProjectGate({
