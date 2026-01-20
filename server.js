@@ -64,18 +64,6 @@ function deepCleanForUtf8(x) {
   }
   return x;
 }
-function buildGoogleNewsRssFeeds(queries, opts = {}) {
-  const { hl = "en-US", gl = "US", ceid = "US:en", limit = 12 } = opts;
-
-  const uniq = (arr) => [...new Set((arr || []).map((x) => String(x || "").trim()).filter(Boolean))];
-
-  return uniq(queries)
-    .slice(0, Math.max(5, Math.min(limit, 12)))
-    .map((q) => {
-      const encoded = encodeURIComponent(q);
-      return `https://news.google.com/rss/search?q=${encoded}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
-    });
-}
 
 // ---- Base44 POST helper ----
 async function postToBase44(url, payload) {
@@ -458,12 +446,9 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
       const m = item?.metrics && typeof item.metrics === "object" ? item.metrics : {};
       const srcC = String(m?.sourceCountry || "").toUpperCase().trim();
       const feedRegion = String(m?.feedRegion || "").toUpperCase().trim();
-      if (srcC || feedRegion) {
-        const ok =
-          (srcC && regionCodes.includes(srcC)) ||
-          (feedRegion && regionCodes.includes(feedRegion));
+      const ok = (srcC && regionCodes.includes(srcC)) || (feedRegion && regionCodes.includes(feedRegion));
       if (!ok) {
-        return { pass: false, reasons: ["region_mismatch"] };
+        return { pass: false, score: 0, reasons: ["region_mismatch_or_unknown"] };
       }
     }
 
@@ -631,11 +616,61 @@ app.post("/scan", requireAuth, async (req, res) => {
     .map((q) => String(q || "").trim())
     .filter((q) => q.length >= 4);
 
-  const regionCodeFrom = (r) => {
-    const s = String(r || "").trim();
-    if (/^[A-Z]{2}$/i.test(s)) return s.toUpperCase();
-    return "";
+  // Convert TrendForge region labels -> representative ISO2 codes.
+  // This powers Google Trends geoSpread and X trends (trends24).
+  // Keep it small (few codes per region) to respect rate limits.
+  const REGION_LABEL_TO_ISO2 = {
+    // broad groupings
+    "Global": ["US", "GB", "IN"],
+    "North America (NORAM)": ["US", "CA"],
+    "Latin America & Caribbean (LATAM)": ["MX", "BR"],
+    "Europe (EU & Non-EU)": ["GB", "FR", "DE"],
+    "Middle East & North Africa (MENA)": ["SA", "EG", "TR"],
+    "Africa (Sub-Saharan)": ["NG", "ZA", "KE"],
+    "Asia-Pacific (APAC)": ["JP", "IN", "AU"],
+    "Central Asia & Caucasus": ["KZ", "AZ", "GE"],
+
+    // allow some common short labels
+    "NORAM": ["US", "CA"],
+    "LATAM": ["MX", "BR"],
+    "EU": ["GB", "FR", "DE"],
+    "MENA": ["SA", "EG", "TR"],
+    "APAC": ["JP", "IN", "AU"],
   };
+
+  function regionIso2sFrom(r) {
+    const s = String(r || "").trim();
+    if (!s) return [];
+    // If caller already gave ISO2, respect it.
+    if (/^[A-Z]{2}$/i.test(s)) return [s.toUpperCase()];
+    // Exact label match.
+    if (REGION_LABEL_TO_ISO2[s]) return REGION_LABEL_TO_ISO2[s];
+    // Loose contains match (e.g. "North America" without suffix)
+    const low = s.toLowerCase();
+    if (low.includes("north america")) return ["US", "CA"];
+    if (low.includes("latin") || low.includes("caribbean")) return ["MX", "BR"];
+    if (low.includes("europe")) return ["GB", "FR", "DE"];
+    if (low.includes("middle east") || low.includes("mena")) return ["SA", "EG", "TR"];
+    if (low.includes("africa")) return ["NG", "ZA", "KE"];
+    if (low.includes("apac") || low.includes("asia")) return ["JP", "IN", "AU"];
+    if (low.includes("central asia") || low.includes("caucasus")) return ["KZ", "AZ", "GE"];
+    return [];
+  }
+
+  function expandedRegionIso2List() {
+    const seen = new Set();
+    const out = [];
+    for (const r of REGIONS) {
+      for (const code of regionIso2sFrom(r)) {
+        if (!code) continue;
+        const c = String(code).toUpperCase();
+        if (seen.has(c)) continue;
+        seen.add(c);
+        out.push(c);
+      }
+    }
+    return out;
+  }
   
   // 🔍 DEBUG WATCHLIST CONTENT
   console.log("📋 watchlist received:", !!watchlist);
@@ -738,17 +773,9 @@ app.post("/scan", requireAuth, async (req, res) => {
       }
             let rssItems = [];
       try {
-        const rssFeeds =
-          STRICT_PROJECT_SCAN && NEWS_QUERIES.length
-            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
-            : getRssFeedsForRegions(REGIONS);
-
-        if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
-          console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
-        }
-
         rssItems = await collectRss({
-          feeds: rssFeeds,
+          feeds: getRssFeedsForRegions(REGIONS),
+          // RSS doesn't support region targeting; include all niches as a single query string.
           nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
           maxPerFeed: 6,
         });
@@ -795,7 +822,7 @@ app.post("/scan", requireAuth, async (req, res) => {
       !hasWatchlist;
 
     const STRICT_PROJECT_SCAN = !isGlobalProject;
-    const windowHours = Number(watchlist?.windowHours || 24);
+    const windowHours = Number(watchlist?.windowHours || 72);
 
     if (STRICT_PROJECT_SCAN) {
       const gateItem = buildProjectGate({
@@ -867,7 +894,7 @@ app.post("/scan", requireAuth, async (req, res) => {
         })
         .slice(0, 10);
 
-      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
+      const regionIso2 = expandedRegionIso2List();
       const trendGeos = STRICT_PROJECT_SCAN ? regionIso2.slice(0, 3) : [];
 
       await Promise.allSettled(
@@ -919,14 +946,19 @@ app.post("/scan", requireAuth, async (req, res) => {
     }
 
     // 4B) Optional: X/Twitter (No API) signal
-    // - Project scans only (STRICT_PROJECT_SCAN)
     // - Read-only, cached, low frequency
     // - Injects xSignal into item.metrics (affects momentumScore only in Base44)
     const X_ENABLED = process.env.X_TRENDS_ENABLED !== "false";
     let xSignalSnapshot = null;
-    if (X_ENABLED && STRICT_PROJECT_SCAN) {
-      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
-      const xRegions = regionIso2.slice(0, 6); // cap regions for safety
+    if (X_ENABLED) {
+      const regionIso2 = expandedRegionIso2List();
+      // Cap regions for safety. Use more granularity for project scans.
+      const xRegions = (STRICT_PROJECT_SCAN ? regionIso2.slice(0, 6) : regionIso2.slice(0, 3));
+
+      // If global scan has no region labels, fall back to a small default set.
+      if (!xRegions.length) {
+        xRegions.push("US", "GB", "IN");
+      }
 
       if (xRegions.length) {
         try {
@@ -1063,5 +1095,5 @@ try {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`TrendForge Trend Service running on port ${PORT}`)
+  console.log('TrendForge Trend Service running on port ${PORT}')
 );
