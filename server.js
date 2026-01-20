@@ -64,6 +64,18 @@ function deepCleanForUtf8(x) {
   }
   return x;
 }
+function buildGoogleNewsRssFeeds(queries, opts = {}) {
+  const { hl = "en-US", gl = "US", ceid = "US:en", limit = 12 } = opts;
+
+  const uniq = (arr) => [...new Set((arr || []).map((x) => String(x || "").trim()).filter(Boolean))];
+
+  return uniq(queries)
+    .slice(0, Math.max(5, Math.min(limit, 12)))
+    .map((q) => {
+      const encoded = encodeURIComponent(q);
+      return `https://news.google.com/rss/search?q=${encoded}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
+    });
+}
 
 // ---- Base44 POST helper ----
 async function postToBase44(url, payload) {
@@ -239,6 +251,36 @@ function normalizeTextLite(s) {
 function tokenizeLite(s) {
   const t = normalizeTextLite(s);
   return t.split(" ").filter(Boolean);
+}
+
+function buildProbeQueriesFromItems(items, opts = {}) {
+  const { limit = 10, addTikTok = true, addInstagram = true } = opts;
+  const out = [];
+  const seen = new Set();
+
+  const pick = (s) => {
+    const txt = String(s || "").trim();
+    if (!txt) return null;
+    // Keep queries short so Google News RSS works well.
+    // Use the first ~7 tokens (but keep hashtags/words).
+    const toks = tokenizeLite(txt).slice(0, 7);
+    const q = toks.join(" ").trim();
+    if (!q) return null;
+    if (seen.has(q)) return null;
+    seen.add(q);
+    return q;
+  };
+
+  for (const it of (items || []).slice(0, limit)) {
+    const base = pick(it?.topicTitle || it?.canonicalTitle || it?.title);
+    if (!base) continue;
+    out.push(base);
+    if (addTikTok) out.push(`${base} TikTok`);
+    if (addInstagram) out.push(`${base} Instagram`);
+    if (out.length >= 12) break;
+  }
+
+  return out.slice(0, 12);
 }
 
 function uniqueStrings(arr = []) {
@@ -446,9 +488,12 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
       const m = item?.metrics && typeof item.metrics === "object" ? item.metrics : {};
       const srcC = String(m?.sourceCountry || "").toUpperCase().trim();
       const feedRegion = String(m?.feedRegion || "").toUpperCase().trim();
-      const ok = (srcC && regionCodes.includes(srcC)) || (feedRegion && regionCodes.includes(feedRegion));
+      if (srcC || feedRegion) {
+        const ok =
+          (srcC && regionCodes.includes(srcC)) ||
+          (feedRegion && regionCodes.includes(feedRegion));
       if (!ok) {
-        return { pass: false, score: 0, reasons: ["region_mismatch_or_unknown"] };
+        return { pass: false, reasons: ["region_mismatch"] };
       }
     }
 
@@ -616,61 +661,11 @@ app.post("/scan", requireAuth, async (req, res) => {
     .map((q) => String(q || "").trim())
     .filter((q) => q.length >= 4);
 
-  // Convert TrendForge region labels -> representative ISO2 codes.
-  // This powers Google Trends geoSpread and X trends (trends24).
-  // Keep it small (few codes per region) to respect rate limits.
-  const REGION_LABEL_TO_ISO2 = {
-    // broad groupings
-    "Global": ["US", "GB", "IN"],
-    "North America (NORAM)": ["US", "CA"],
-    "Latin America & Caribbean (LATAM)": ["MX", "BR"],
-    "Europe (EU & Non-EU)": ["GB", "FR", "DE"],
-    "Middle East & North Africa (MENA)": ["SA", "EG", "TR"],
-    "Africa (Sub-Saharan)": ["NG", "ZA", "KE"],
-    "Asia-Pacific (APAC)": ["JP", "IN", "AU"],
-    "Central Asia & Caucasus": ["KZ", "AZ", "GE"],
-
-    // allow some common short labels
-    "NORAM": ["US", "CA"],
-    "LATAM": ["MX", "BR"],
-    "EU": ["GB", "FR", "DE"],
-    "MENA": ["SA", "EG", "TR"],
-    "APAC": ["JP", "IN", "AU"],
-  };
-
-  function regionIso2sFrom(r) {
+  const regionCodeFrom = (r) => {
     const s = String(r || "").trim();
-    if (!s) return [];
-    // If caller already gave ISO2, respect it.
-    if (/^[A-Z]{2}$/i.test(s)) return [s.toUpperCase()];
-    // Exact label match.
-    if (REGION_LABEL_TO_ISO2[s]) return REGION_LABEL_TO_ISO2[s];
-    // Loose contains match (e.g. "North America" without suffix)
-    const low = s.toLowerCase();
-    if (low.includes("north america")) return ["US", "CA"];
-    if (low.includes("latin") || low.includes("caribbean")) return ["MX", "BR"];
-    if (low.includes("europe")) return ["GB", "FR", "DE"];
-    if (low.includes("middle east") || low.includes("mena")) return ["SA", "EG", "TR"];
-    if (low.includes("africa")) return ["NG", "ZA", "KE"];
-    if (low.includes("apac") || low.includes("asia")) return ["JP", "IN", "AU"];
-    if (low.includes("central asia") || low.includes("caucasus")) return ["KZ", "AZ", "GE"];
-    return [];
-  }
-
-  function expandedRegionIso2List() {
-    const seen = new Set();
-    const out = [];
-    for (const r of REGIONS) {
-      for (const code of regionIso2sFrom(r)) {
-        if (!code) continue;
-        const c = String(code).toUpperCase();
-        if (seen.has(c)) continue;
-        seen.add(c);
-        out.push(c);
-      }
-    }
-    return out;
-  }
+    if (/^[A-Z]{2}$/i.test(s)) return s.toUpperCase();
+    return "";
+  };
   
   // 🔍 DEBUG WATCHLIST CONTENT
   console.log("📋 watchlist received:", !!watchlist);
@@ -773,9 +768,17 @@ app.post("/scan", requireAuth, async (req, res) => {
       }
             let rssItems = [];
       try {
+        const rssFeeds =
+          STRICT_PROJECT_SCAN && NEWS_QUERIES.length
+            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+            : getRssFeedsForRegions(REGIONS);
+
+        if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
+          console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
+        }
+
         rssItems = await collectRss({
-          feeds: getRssFeedsForRegions(REGIONS),
-          // RSS doesn't support region targeting; include all niches as a single query string.
+          feeds: rssFeeds,
           nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
           maxPerFeed: 6,
         });
@@ -822,7 +825,7 @@ app.post("/scan", requireAuth, async (req, res) => {
       !hasWatchlist;
 
     const STRICT_PROJECT_SCAN = !isGlobalProject;
-    const windowHours = Number(watchlist?.windowHours || 72);
+    const windowHours = Number(watchlist?.windowHours || 24);
 
     if (STRICT_PROJECT_SCAN) {
       const gateItem = buildProjectGate({
@@ -894,7 +897,7 @@ app.post("/scan", requireAuth, async (req, res) => {
         })
         .slice(0, 10);
 
-      const regionIso2 = expandedRegionIso2List();
+      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
       const trendGeos = STRICT_PROJECT_SCAN ? regionIso2.slice(0, 3) : [];
 
       await Promise.allSettled(
@@ -946,19 +949,14 @@ app.post("/scan", requireAuth, async (req, res) => {
     }
 
     // 4B) Optional: X/Twitter (No API) signal
+    // - Project scans only (STRICT_PROJECT_SCAN)
     // - Read-only, cached, low frequency
     // - Injects xSignal into item.metrics (affects momentumScore only in Base44)
     const X_ENABLED = process.env.X_TRENDS_ENABLED !== "false";
     let xSignalSnapshot = null;
-    if (X_ENABLED) {
-      const regionIso2 = expandedRegionIso2List();
-      // Cap regions for safety. Use more granularity for project scans.
-      const xRegions = (STRICT_PROJECT_SCAN ? regionIso2.slice(0, 6) : regionIso2.slice(0, 3));
-
-      // If global scan has no region labels, fall back to a small default set.
-      if (!xRegions.length) {
-        xRegions.push("US", "GB", "IN");
-      }
+    if (X_ENABLED && STRICT_PROJECT_SCAN) {
+      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
+      const xRegions = regionIso2.slice(0, 6); // cap regions for safety
 
       if (xRegions.length) {
         try {
@@ -1016,6 +1014,80 @@ app.post("/scan", requireAuth, async (req, res) => {
       return a;
     }, {});
     console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
+
+    // 6B) News enrichment pass (NO scraping, no API keys)
+    // If strict gating leaves you with mostly YouTube (common when RSS feeds block/403),
+    // we pull additional *fresh* Google News RSS search feeds seeded from the top items.
+    // This increases source diversity without loosening the niche/watchlist gate.
+    const newsCountAfter = Number(platformCountsAfter?.news || 0);
+    const ytCountAfter = Number(platformCountsAfter?.youtube || 0);
+    const SHOULD_ENRICH_NEWS = requested.includes("news") && ytCountAfter > 0 && newsCountAfter < 4;
+
+    if (SHOULD_ENRICH_NEWS) {
+      try {
+        const seeds = items.filter((it) => safePlatform(it.platform) === "youtube").slice(0, 10);
+        const probeQueries = buildProbeQueriesFromItems(seeds, { limit: 10, addTikTok: true, addInstagram: true });
+        if (probeQueries.length) {
+          const probeFeeds = buildGoogleNewsRssFeeds(probeQueries, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 });
+          console.log("🧲 Enriching news via Google News RSS (seeded):", { probes: probeQueries.length, feeds: probeFeeds.length });
+
+          const extraRss = await collectRss({
+            feeds: probeFeeds,
+            nicheName: probeQueries.join(" OR "),
+            maxPerFeed: 5,
+          });
+
+          const extraNormalized = (extraRss || []).map((raw) => {
+            const normalized = normalizeTrendItem(raw);
+            const platform = safePlatform(normalized.platform || raw.platform || "news");
+            const sourceUrl = safeUrlFrom(raw, normalized);
+            return { ...normalized, platform, sourceUrl };
+          });
+
+          if (extraNormalized.length) {
+            const beforeAdd = items.length;
+            items.push(...extraNormalized);
+            items = dedupeByPlatformAndUrl(items);
+
+            // Re-apply strict project gate so we don't pollute topics.
+            if (STRICT_PROJECT_SCAN) {
+              const gateItem = buildProjectGate({
+                niches: NICHES,
+                newsQueries: NEWS_QUERIES,
+                watchlist,
+                regions: REGIONS,
+                windowHours,
+              });
+              items = items.filter((it) => {
+                const verdict = gateItem(it);
+                it.metrics = (it.metrics && typeof it.metrics === "object") ? it.metrics : {};
+                it.metrics.projectMatch = {
+                  strict: true,
+                  pass: !!verdict.pass,
+                  score: Number(verdict.score || 0),
+                  reasons: verdict.reasons || [],
+                  matched: verdict.matched || [],
+                };
+                return !!verdict.pass;
+              });
+            }
+
+            // Re-score + resort after enrichment.
+            scoreItemsComparable(items);
+            items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
+
+            const countsNow = items.reduce((a, it) => {
+              const p = safePlatform(it.platform);
+              a[p] = (a[p] || 0) + 1;
+              return a;
+            }, {});
+            console.log("🧲 News enrichment complete:", { beforeAdd, after: items.length, countsNow });
+          }
+        }
+      } catch (e) {
+        console.log("⚠️ News enrichment failed (continuing):", e?.message || e);
+      }
+    }
 
     // 7) STORE pool (important for Base44 topic building)
     const MAX_STORE = 60;
@@ -1097,3 +1169,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log('TrendForge Trend Service running on port ${PORT}')
 );
+}

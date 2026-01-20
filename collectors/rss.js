@@ -4,6 +4,22 @@ import { sanitizeText, toPlainString } from "../utils/text.js";
 
 const parser = new XMLParser({ ignoreAttributes: false });
 
+function detectSocialHints(text) {
+  const t = String(text || "").toLowerCase();
+  // Deterministic keyword-based detection.
+  // We do NOT scrape social platforms; we only infer "mentions" from public news/RSS text.
+  const hasTikTok = /\btiktok\b/.test(t) || /\btt\b/.test(t);
+  const hasInstagram = /\binstagram\b/.test(t) || /\big\b/.test(t);
+  const hasReels = /\breels\b/.test(t) || /\binsta\s*reels\b/.test(t);
+  const hasShorts = /\byoutube\s*shorts\b/.test(t) || /\bshorts\b/.test(t);
+  return {
+    tiktokMention: !!hasTikTok,
+    instagramMention: !!hasInstagram,
+    reelsMention: !!hasReels,
+    shortsMention: !!hasShorts,
+  };
+}
+
 export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
   const out = [];
 
@@ -67,16 +83,21 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
 
       const summaryRaw = it?.description ?? it?.summary ?? "";
 
+      const titleClean = sanitizeText(toPlainString(titleRaw), { maxLen: 220 });
+      const summaryClean = sanitizeText(toPlainString(summaryRaw), { maxLen: 700 });
+      const socialHints = detectSocialHints(`${titleClean} ${summaryClean}`);
+
       out.push({
         platform: "news",
-        topicTitle: sanitizeText(toPlainString(titleRaw), { maxLen: 220 }),
-        topicSummary: sanitizeText(toPlainString(summaryRaw), { maxLen: 700 }),
+        topicTitle: titleClean,
+        topicSummary: summaryClean,
         sourceUrl: String(link).trim(),
         publishedAt: it?.pubDate ?? it?.published ?? null,
         author: it?.author?.name ?? it?.author ?? "",
         metrics: {
           feedUrl,
           rss: true,
+          socialHints,
           ...(feedRegion ? { feedRegion } : {}),
           ...(feedLanguage ? { language: feedLanguage } : {}),
           ...(feedPriority ? { sourcePriority: feedPriority } : {}),

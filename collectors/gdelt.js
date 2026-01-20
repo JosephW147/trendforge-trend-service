@@ -2,6 +2,20 @@ import { fetchWithRetry } from "../utils/retry.js";
 
 const GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc";
 
+function detectSocialHints(text) {
+  const t = String(text || "").toLowerCase();
+  const hasTikTok = /\btiktok\b/.test(t) || /\btt\b/.test(t);
+  const hasInstagram = /\binstagram\b/.test(t) || /\big\b/.test(t);
+  const hasReels = /\breels\b/.test(t) || /\binsta\s*reels\b/.test(t);
+  const hasShorts = /\byoutube\s*shorts\b/.test(t) || /\bshorts\b/.test(t);
+  return {
+    tiktokMention: !!hasTikTok,
+    instagramMention: !!hasInstagram,
+    reelsMention: !!hasReels,
+    shortsMention: !!hasShorts,
+  };
+}
+
 export async function collectGdelt({ nicheName, region = "Global", max = 25 }) {
   // GDELT supports a Lucene-like query syntax. We keep it conservative:
   // - nicheName is the main query
@@ -64,6 +78,7 @@ export async function collectGdelt({ nicheName, region = "Global", max = 25 }) {
         sourceCountry: a?.sourceCountry,
         tone: a?.tone,
         gdelt: true,
+        socialHints: detectSocialHints(`${a?.title || ""} ${a?.description || a?.snippet || ""}`),
       },
       queryUsed: nicheName,
     }))
