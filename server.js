@@ -235,14 +235,12 @@ app.post("/editorial", requireAuth, async (req, res) => {
 
 // ---- Scan ----
 app.post("/scan", requireAuth, async (req, res) => {
-  console.log("🔥 /scan HIT", new Date().toISOString());
-  console.log("Headers:", {
-    authorization: (req.headers.authorization || "").slice(0, 25) + "...",
-    "x-trace-id": req.headers["x-trace-id"],
-    "cf-ray": req.headers["cf-ray"],
-  });
-  console.log("Body:", req.body);
-
+  console.log("🔥🔥🔥 /scan HIT (TOP)", new Date().toISOString());
+  console.log("X-Trace-Id:", req.headers["x-trace-id"]);
+  console.log("CF-RAY:", req.headers["cf-ray"]);
+  console.log("rndr-id header will be added by Render (response)");
+  console.log("Body keys:", Object.keys(req.body || {}));
+ 
   const {
     trendRunId,
     projectId,
