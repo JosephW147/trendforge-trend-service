@@ -291,7 +291,9 @@ app.post("/scan", requireAuth, async (req, res) => {
   const NICHES = uniq(nicheList);
   const REGIONS = uniq(regionList);
 
-  const NEWS_QUERIES = uniq(Array.isArray(newsQueries) ? newsQueries : NICHES);
+  const NEWS_QUERIES = uniq(Array.isArray(newsQueries) ? newsQueries : NICHES)
+    .map((q) => String(q || "").trim())
+    .filter((q) => q.length >= 4);
 
   const regionCodeFrom = (r) => {
     const s = String(r || "").trim();
@@ -490,21 +492,34 @@ app.post("/scan", requireAuth, async (req, res) => {
     console.log("🏆 platformCounts in top 20 after scoring:", topCounts);
 
     // 7) STORE pool (important for Base44 topic building)
-    const MAX_STORE = 120;
+    const MAX_STORE = 60;
     const storeItems = items.slice(0, MAX_STORE);
 
     console.log("✅ STORE TrendItems count:", storeItems.length);
 
     // 8) Ingest TrendItems (STORE pool)
     console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
-    const ingestResp = await postToBase44(process.env.BASE44_INGEST_URL, {
-      trendRunId,
-      projectId,
-      items: storeItems,
-    });
-    console.log("✅ Base44 TrendItems ingest response:", ingestResp);
-    // Give Base44 a brief breather after a large ingest to reduce throttling
-    await sleep(1200);
+
+    let ingestResp;
+    try {
+      ingestResp = await postToBase44WithBackoff(
+        process.env.BASE44_INGEST_URL,
+        {
+          trendRunId,
+          projectId,
+          items: storeItems,
+        },
+        { retries: 8, baseDelayMs: 900, maxDelayMs: 15_000 }
+      );
+      console.log("✅ Base44 TrendItems ingest response:", ingestResp);
+
+      // Give Base44 a brief breather after a large ingest to reduce throttling
+      await sleep(1200);
+    } catch (e) {
+      // If Base44 is down/flaky, fail gracefully and mark the run error
+      throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
+    }
+
 
 
     const storeCounts = storeItems.reduce((a, it) => {
