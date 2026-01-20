@@ -493,7 +493,7 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
           (srcC && regionCodes.includes(srcC)) ||
           (feedRegion && regionCodes.includes(feedRegion));
       if (!ok) {
-        return { pass: false, reasons: ["region_mismatch"] };
+        return { pass: false, score: 0, reasons: ["region_mismatch"] };
       }
     }
 
