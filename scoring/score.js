@@ -59,10 +59,22 @@ export function rawScoreItem(item) {
     // Slightly slower decay than youtube so news isn't *only* "newest minute wins"
     const f = freshness01(publishedAt, 36, 96);
 
-    const sourceRank = Number(metrics.sourceRank || 0); // optional 0..1
+    // RSS feeds can optionally attach a priority (1=highest). We map it to 0..1.
+    const srcPriority = Number(metrics.sourcePriority);
+    const priorityRank = Number.isFinite(srcPriority)
+      ? srcPriority === 1
+        ? 1
+        : srcPriority === 2
+          ? 0.7
+          : srcPriority === 3
+            ? 0.4
+            : 0.5
+      : 0;
+
+    const sourceRank = Number(metrics.sourceRank || 0); // optional 0..1 (external)
     const relevance = Number(metrics.relevance || 0);   // optional 0..1
 
-    const sr01 = clamp01(sourceRank);
+    const sr01 = clamp01(Math.max(sourceRank, priorityRank));
     const rel01 = clamp01(relevance);
 
     return clamp01(0.75 * f + 0.15 * sr01 + 0.10 * rel01);

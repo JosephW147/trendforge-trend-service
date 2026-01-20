@@ -7,7 +7,14 @@ const parser = new XMLParser({ ignoreAttributes: false });
 export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
   const out = [];
 
-  for (const feedUrl of feeds) {
+  for (const feed of feeds) {
+    const feedUrl = typeof feed === "string" ? feed : feed?.url;
+    if (!feedUrl) continue;
+
+    const feedRegion = typeof feed === "object" ? feed?.region : undefined;
+    const feedLanguage = typeof feed === "object" ? feed?.language : undefined;
+    const feedPriority = typeof feed === "object" ? feed?.priority : undefined;
+
     const res = await fetchWithRetry(feedUrl, { method: "GET" }, { retries: 2 });
     if (!res.ok) continue;
 
@@ -39,7 +46,13 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
         sourceUrl: String(link).trim(),
         publishedAt: it?.pubDate ?? it?.published ?? null,
         author: it?.author?.name ?? it?.author ?? "",
-        metrics: { feedUrl, rss: true },
+        metrics: {
+          feedUrl,
+          rss: true,
+          ...(feedRegion ? { feedRegion } : {}),
+          ...(feedLanguage ? { language: feedLanguage } : {}),
+          ...(feedPriority ? { sourcePriority: feedPriority } : {}),
+        },
         queryUsed: nicheName,
       });
     }

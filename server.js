@@ -6,7 +6,7 @@ import { collectYouTubeTrends } from "./youtubeCollector.js";
 import { collectYouTubeWatchlist } from "./youtubeWatchlistCollector.js";
 import { collectGdelt } from "./collectors/gdelt.js";
 import { collectRss } from "./collectors/rss.js";
-import { DEFAULT_RSS_FEEDS } from "./config/rssFeeds.js";
+import { getRssFeedsForRegions } from "./config/rssFeeds.js";
 
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItemsComparable } from "./scoring/score.js";
@@ -246,6 +246,8 @@ app.post("/scan", requireAuth, async (req, res) => {
     platforms = ["youtube"],
     region = "Global",
     regions,
+    // Optional: richer hints for news collectors (project keywords + niches)
+    newsQueries,
     // Optional watchlist:
     // {
     //   channels: [{ label, channelId, enabled, frequency }],
@@ -288,6 +290,8 @@ app.post("/scan", requireAuth, async (req, res) => {
 
   const NICHES = uniq(nicheList);
   const REGIONS = uniq(regionList);
+
+  const NEWS_QUERIES = uniq(Array.isArray(newsQueries) ? newsQueries : NICHES);
 
   const regionCodeFrom = (r) => {
     const s = String(r || "").trim();
@@ -382,15 +386,15 @@ app.post("/scan", requireAuth, async (req, res) => {
       const gdeltItems = [];
       const MAX_GDELT_COMBOS = 12;
       const combos = [];
-      for (const n of NICHES) for (const r of REGIONS) combos.push({ n, r });
+      for (const n of NEWS_QUERIES) for (const r of REGIONS) combos.push({ n, r });
       for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
         const part = await collectGdelt({ nicheName: n, region: r, max: 25 });
         gdeltItems.push(...(part || []));
       }
       const rssItems = await collectRss({
-        feeds: DEFAULT_RSS_FEEDS,
+        feeds: getRssFeedsForRegions(REGIONS),
         // RSS doesn't support region targeting; include all niches as a single query string.
-        nicheName: NICHES.join(" OR ") || nicheName,
+        nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
         maxPerFeed: 6,
       });
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
