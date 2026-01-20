@@ -16,13 +16,39 @@ export async function collectGdelt({ nicheName, region = "Global", max = 25 }) {
   const q = encodeURIComponent(query);
   const url = `${GDELT_DOC_URL}?query=${q}&mode=ArtList&format=json&maxrecords=${max}&sort=hybridrel`;
 
-  const res = await fetchWithRetry(url, { method: "GET" }, { retries: 3 });
+  // GDELT occasionally returns a 200 response containing non-JSON (e.g., a plain-text
+  // rate-limit / search-limit message). If we call res.json() directly, Node will throw:
+  // "Unexpected token ... is not valid JSON" and the whole scan fails.
+  //
+  // We defensively parse and treat "non-JSON" as a transient failure so the pipeline can
+  // continue (RSS still provides news coverage).
+  const res = await fetchWithRetry(
+    url,
+    {
+      method: "GET",
+      headers: {
+        // Some edge networks behave better with an explicit UA.
+        "user-agent": "TrendForgeBot/1.0 (+https://trendforge.local)",
+        accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+      },
+    },
+    { retries: 3 }
+  );
+
+  const bodyText = await res.text();
   if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`GDELT failed ${res.status}: ${txt.slice(0, 200)}`);
+    throw new Error(`GDELT failed ${res.status}: ${bodyText.slice(0, 200)}`);
   }
 
-  const json = await res.json();
+  let json;
+  try {
+    json = JSON.parse(bodyText);
+  } catch {
+    const snippet = bodyText.replace(/\s+/g, " ").slice(0, 220);
+    const err = new Error(`GDELT returned non-JSON body: ${snippet}`);
+    err.code = "GDELT_NON_JSON";
+    throw err;
+  }
   const articles = json?.articles || [];
 
   return articles

@@ -388,8 +388,15 @@ app.post("/scan", requireAuth, async (req, res) => {
       const combos = [];
       for (const n of NEWS_QUERIES) for (const r of REGIONS) combos.push({ n, r });
       for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
-        const part = await collectGdelt({ nicheName: n, region: r, max: 25 });
-        gdeltItems.push(...(part || []));
+        try {
+          const part = await collectGdelt({ nicheName: n, region: r, max: 25 });
+          gdeltItems.push(...(part || []));
+        } catch (e) {
+          // GDELT occasionally replies with 200 + plain text (non-JSON) or a throttling message.
+          // We treat that as best-effort and keep the scan running so RSS still works.
+          const msg = e?.message || String(e);
+          console.error(`⚠️ GDELT failed (continuing): niche="${n}" region="${r}" ->`, msg.slice(0, 240));
+        }
       }
       const rssItems = await collectRss({
         feeds: getRssFeedsForRegions(REGIONS),
