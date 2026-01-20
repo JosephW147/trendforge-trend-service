@@ -20,13 +20,32 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
     let data;
 
     try {
-      res = await fetchWithRetry(feedUrl, { method: "GET" }, { retries: 2 });
-      if (!res?.ok) continue;
+      res = await fetchWithRetry(
+        feedUrl,
+        {
+          method: "GET",
+          headers: {
+            // Many RSS hosts require a UA / Accept header to return content
+            "User-Agent": "TrendForgeRSS/1.0 (+https://trendforge-trend-service.onrender.com)",
+            "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
+          },
+        },
+        { retries: 2, timeoutMs: 15000 }
+      );
+    } catch (e) {
+      console.log(`⚠️ RSS feed failed (skipping): ${feedUrl} ->`, e?.message || e);
+      continue;
+    }
 
+    if (!res?.ok) {
+      console.log(`⚠️ RSS feed non-OK (skipping): ${feedUrl} -> ${res?.status}`);
+      continue;
+    }
+    try {
       xml = await res.text();
       data = parser.parse(xml);
     } catch (e) {
-      console.error(`⚠️ RSS feed failed (skipping): ${feedUrl} ->`, e?.message || e);
+      console.log(`⚠️ RSS parse failed (skipping): ${feedUrl} ->`, e?.message || e);
       continue;
     }
 
