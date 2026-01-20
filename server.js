@@ -11,6 +11,7 @@ import { getRssFeedsForRegions } from "./config/rssFeeds.js";
 import { normalizeTrendItem } from "./normalize/trendItem.js";
 import { scoreItemsComparable } from "./scoring/score.js";
 import { fetchGoogleTrendsSignal } from "./collectors/googleTrends.js";
+import { fetchXTrends } from "./collectors/xTrends.js";
 import { buildEditorial } from "./editorial/buildEditorial.js";
 
 const app = express();
@@ -192,6 +193,320 @@ function safeUrlFrom(raw, normalized) {
   );
 }
 
+// Strip common tracking params so we dedupe better (especially RSS)
+function canonicalizeUrl(u) {
+  try {
+    const url = new URL(String(u || "").trim());
+    // remove obvious tracking parameters
+    const drop = new Set([
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "utm_id",
+      "utm_name",
+      "utm_reader",
+      "utm_referrer",
+      "gclid",
+      "fbclid",
+      "mc_cid",
+      "mc_eid",
+      "ref",
+      "ref_src",
+      "igshid",
+    ]);
+    for (const k of [...url.searchParams.keys()]) {
+      if (drop.has(k.toLowerCase())) url.searchParams.delete(k);
+    }
+    // Keep path/query but drop hash
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return String(u || "").trim();
+  }
+}
+
+function normalizeTextLite(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9\s#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeLite(s) {
+  const t = normalizeTextLite(s);
+  return t.split(" ").filter(Boolean);
+}
+
+function uniqueStrings(arr = []) {
+  const out = [];
+  const seen = new Set();
+  for (const x of arr || []) {
+    const s = String(x || "").trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function parseDateMsSafe(dt) {
+  if (!dt) return NaN;
+  const t = new Date(dt).getTime();
+  return Number.isNaN(t) ? NaN : t;
+}
+
+// ---- X/Twitter (No API) lightweight state cache (in-memory) ----
+// Used to compute mentions_delta / trend_rank_change between scans.
+// Keyed by projectId + region + normalizedTerm.
+const xPrevCache = new Map();
+
+function normTermKey(s) {
+  return String(s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/^#+/, "#")
+    .replace(/\s+/g, " ")
+    .slice(0, 140);
+}
+
+function extractHashtagsLite(text) {
+  const t = String(text || "");
+  const m = t.match(/#[A-Za-z0-9_]{2,80}/g);
+  return m ? m.map((x) => x.toLowerCase()) : [];
+}
+
+function buildPrevXMap(prevSnapshot) {
+  // Expected shape: { v: 1, rows: [{ region, term, rank, volume }] }
+  const map = new Map();
+  const rows = prevSnapshot && typeof prevSnapshot === "object" ? prevSnapshot.rows : null;
+  if (!Array.isArray(rows)) return map;
+  for (const r of rows) {
+    const region = String(r?.region || "").toUpperCase().trim() || "ALL";
+    const term = normTermKey(r?.term);
+    if (!term) continue;
+    map.set(`${region}::${term}`, {
+      rank: Number(r?.rank || 0),
+      volume: Number(r?.volume || 0),
+    });
+  }
+  return map;
+}
+
+function attachXSignalsToItems({ items, xRows, projectId, totalRegions, prevSnapshot }) {
+  if (!Array.isArray(items) || !items.length) return;
+  if (!Array.isArray(xRows) || !xRows.length) return;
+
+  const prevMap = buildPrevXMap(prevSnapshot);
+
+  // Build aggregate per term across regions.
+  const agg = new Map();
+  for (const r of xRows) {
+    const term = normTermKey(r.term);
+    if (!term) continue;
+    const key = term;
+    if (!agg.has(key)) {
+      agg.set(key, {
+        term: r.term,
+        regions: new Set(),
+        bestRank: Number(r.rank || 9999),
+        totalVolume: Number(r.volume || 0),
+        // we'll compute deltas later per region
+        perRegion: new Map(),
+      });
+    }
+    const a = agg.get(key);
+    a.regions.add(String(r.region || "").toUpperCase());
+    a.bestRank = Math.min(a.bestRank, Number(r.rank || 9999));
+    a.totalVolume += Number(r.volume || 0);
+    a.perRegion.set(String(r.region || "").toUpperCase(), { rank: Number(r.rank || 0), volume: Number(r.volume || 0) });
+  }
+
+  // Helper: find best matching X term for an item.
+  function bestMatchForItem(it) {
+    const title = String(it?.topicTitle || "");
+    const summary = String(it?.topicSummary || "");
+    const combined = normalizeTextLite(`${title} ${summary}`);
+    const tags = new Set(extractHashtagsLite(`${title} ${summary}`));
+
+    let best = null;
+    let bestScore = 0;
+
+    for (const [k, a] of agg.entries()) {
+      const bare = k.startsWith("#") ? k.slice(1) : k;
+      // direct hashtag match
+      if (k.startsWith("#") && tags.has(k)) {
+        const score = 1.0;
+        if (score > bestScore) { bestScore = score; best = a; }
+        continue;
+      }
+
+      // phrase match
+      if (bare && combined.includes(bare)) {
+        // Prefer tighter rank + more regions when ties.
+        const score = 0.85;
+        if (score > bestScore) { bestScore = score; best = a; }
+      }
+    }
+
+    return best;
+  }
+
+  for (const it of items) {
+    const match = bestMatchForItem(it);
+    if (!match) continue;
+
+    // Compute per-term deltas using best available region row (if any)
+    // If item has a known sourceCountry/feedRegion in its metrics, prefer that region.
+    const m = (it.metrics && typeof it.metrics === "object") ? it.metrics : {};
+    const srcRegion = String(m.sourceCountry || m.feedRegion || "").toUpperCase().trim();
+
+    let curRank = match.bestRank;
+    let curVol = match.totalVolume;
+    if (srcRegion && match.perRegion.has(srcRegion)) {
+      const pr = match.perRegion.get(srcRegion);
+      curRank = Number(pr.rank || curRank);
+      curVol = Number(pr.volume || 0);
+    }
+
+    const cacheKey = `${projectId}::${srcRegion || "ALL"}::${normTermKey(match.term)}`;
+
+    // Prefer persisted snapshot (stable across restarts), fall back to in-memory cache.
+    const prevFromSnap = prevMap.get(`${srcRegion || "ALL"}::${normTermKey(match.term)}`) || null;
+    const prev = prevFromSnap || xPrevCache.get(cacheKey) || null;
+    const prevRank = prev ? Number(prev.rank || 0) : 0;
+    const prevVol = prev ? Number(prev.volume || 0) : 0;
+
+    const mentions_delta = prev ? ((curVol - prevVol) / Math.max(1, prevVol)) : 0;
+    const trend_rank_change = prev ? (prevRank - curRank) : 0;
+    const region_presence = totalRegions > 0 ? (match.regions.size / totalRegions) : 0;
+
+    // Persist current snapshot
+    xPrevCache.set(cacheKey, { rank: curRank, volume: curVol, ts: Date.now() });
+
+    it.metrics = m;
+    it.metrics.xSignal = {
+      ok: true,
+      term: match.term,
+      mentions_delta,
+      trend_rank_change,
+      region_presence,
+      rank: curRank,
+      volume: curVol,
+      regions_count: match.regions.size,
+      total_regions: totalRegions,
+      source: "trends24",
+    };
+  }
+}
+
+function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours }) {
+  const positives = uniqueStrings([
+    ...(Array.isArray(niches) ? niches : []),
+    ...(Array.isArray(newsQueries) ? newsQueries : []),
+    ...((watchlist?.keywords || []).map((k) => k?.query).filter(Boolean)),
+  ]);
+
+  // optional negatives (safe to ignore if not present)
+  const negatives = uniqueStrings([
+    ...((watchlist?.negativeKeywords || watchlist?.blockedKeywords || []) || []),
+  ]);
+
+  const regionCodes = uniqueStrings((regions || []).map((r) => String(r || "").trim()))
+    .filter((r) => /^[A-Z]{2}$/i.test(r))
+    .map((r) => r.toUpperCase());
+
+  const windowMs = Math.max(1, Number(windowHours || 72)) * 36e5;
+
+  return function gateItem(item) {
+    const reasons = [];
+    const title = String(item?.topicTitle || "");
+    const summary = String(item?.topicSummary || "");
+    const author = String(item?.author || "");
+    const text = normalizeTextLite(`${title} ${summary} ${author}`);
+
+    // 1) Freshness hard gate for NEWS/RSS
+    const p = safePlatform(item?.platform);
+    if (p === "news") {
+      const ts = parseDateMsSafe(item?.publishedAt);
+      if (Number.isNaN(ts)) {
+        return { pass: false, score: 0, reasons: ["missing_or_invalid_publishedAt"] };
+      }
+      const ageMs = Date.now() - ts;
+      if (ageMs > windowMs) {
+        return { pass: false, score: 0, reasons: ["stale_over_windowHours"] };
+      }
+    }
+
+    // 2) Region hard gate (only when user provided ISO2 codes)
+    if (p === "news" && regionCodes.length) {
+      const m = item?.metrics && typeof item.metrics === "object" ? item.metrics : {};
+      const srcC = String(m?.sourceCountry || "").toUpperCase().trim();
+      const feedRegion = String(m?.feedRegion || "").toUpperCase().trim();
+      const ok = (srcC && regionCodes.includes(srcC)) || (feedRegion && regionCodes.includes(feedRegion));
+      if (!ok) {
+        return { pass: false, score: 0, reasons: ["region_mismatch_or_unknown"] };
+      }
+    }
+
+    // 3) Negative keyword block (hard)
+    for (const neg of negatives) {
+      const n = normalizeTextLite(neg);
+      if (n && text.includes(n)) {
+        return { pass: false, score: 0, reasons: ["blocked_keyword"] };
+      }
+    }
+
+    // 4) Positive matching (watchlist/niche/newsQueries)
+    if (!positives.length) {
+      // If there are no positive constraints, don't block (acts like global scan)
+      return { pass: true, score: 0.25, reasons: ["no_positive_constraints"] };
+    }
+
+    let best = 0;
+    const matched = [];
+
+    const tokens = new Set(tokenizeLite(text));
+
+    for (const q of positives) {
+      const qn = normalizeTextLite(q);
+      if (!qn) continue;
+
+      // phrase match (strong)
+      if (text.includes(qn)) {
+        best = Math.max(best, 1);
+        matched.push(q);
+        continue;
+      }
+
+      // token overlap (medium): require 2+ tokens overlap when query has multiple tokens
+      const qTokens = tokenizeLite(qn);
+      if (!qTokens.length) continue;
+      let hit = 0;
+      for (const t of qTokens) if (tokens.has(t)) hit++;
+
+      if (qTokens.length === 1 && hit === 1) {
+        best = Math.max(best, 0.55);
+        matched.push(q);
+      } else if (hit >= 2) {
+        const ratio = hit / qTokens.length;
+        best = Math.max(best, Math.min(0.9, 0.5 + 0.4 * ratio));
+        matched.push(q);
+      }
+    }
+
+    if (best <= 0) {
+      return { pass: false, score: 0, reasons: ["no_watchlist_or_niche_match"] };
+    }
+
+    reasons.push("matched_positive_terms");
+    return { pass: true, score: best, reasons, matched };
+  };
+}
+
 function pickTrendsQuery(item) {
   // simple heuristic: title trimmed
   const t = String(item.topicTitle || "").trim();
@@ -203,11 +518,12 @@ function dedupeByPlatformAndUrl(items) {
   const seen = new Set();
   return items.filter((it) => {
     const p = safePlatform(it.platform);
-    const u = String(it.sourceUrl || "").trim();
+    const u = canonicalizeUrl(String(it.sourceUrl || "").trim());
     if (!u) return false;
     const key = `${p}::${u}`;
     if (seen.has(key)) return false;
     seen.add(key);
+    it.sourceUrl = u;
     return true;
   });
 }
@@ -258,6 +574,8 @@ app.post("/scan", requireAuth, async (req, res) => {
     //   frequency: "hourly" | "daily" (filter which to run)
     // }
     watchlist,
+    // Optional: persisted X snapshot from previous run (Base44 TrendRuns.runNotes)
+    xPrevSnapshot,
   } = req.body || {};
 
   // Multi-select support (Base44 can send niches/regions arrays)
@@ -444,6 +762,65 @@ app.post("/scan", requireAuth, async (req, res) => {
     // 3) Dedupe BEFORE scoring/trends
     items = dedupeByPlatformAndUrl(items);
 
+    // 3B) STRICT project-scan gating (Global scan stays discovery-oriented)
+    const hasWatchlist = !!(watchlist && ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0));
+    const isGlobalProject =
+      NICHES.length === 1 &&
+      String(NICHES[0] || "").trim().toLowerCase() === "global" &&
+      REGIONS.length === 1 &&
+      String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
+      !hasWatchlist;
+
+    const STRICT_PROJECT_SCAN = !isGlobalProject;
+    const windowHours = Number(watchlist?.windowHours || 72);
+
+    if (STRICT_PROJECT_SCAN) {
+      const gateItem = buildProjectGate({
+        niches: NICHES,
+        newsQueries: NEWS_QUERIES,
+        watchlist,
+        regions: REGIONS,
+        windowHours,
+      });
+
+      const before = items.length;
+      let droppedStale = 0;
+      let droppedNoMatch = 0;
+      let droppedRegion = 0;
+
+      items = items.filter((it) => {
+        const verdict = gateItem(it);
+        // attach for downstream topic gating/debug (persisted via metricsJson)
+        it.metrics = (it.metrics && typeof it.metrics === "object") ? it.metrics : {};
+        it.metrics.projectMatch = {
+          strict: true,
+          pass: !!verdict.pass,
+          score: Number(verdict.score || 0),
+          reasons: verdict.reasons || [],
+          matched: verdict.matched || [],
+        };
+
+        if (!verdict.pass) {
+          const rs = verdict.reasons || [];
+          if (rs.includes("missing_or_invalid_publishedAt") || rs.includes("stale_over_windowHours")) droppedStale++;
+          else if (rs.includes("region_mismatch_or_unknown")) droppedRegion++;
+          else droppedNoMatch++;
+        }
+        return !!verdict.pass;
+      });
+
+      console.log(
+        "🧹 STRICT project gate applied:",
+        { before, after: items.length, droppedStale, droppedRegion, droppedNoMatch, windowHours }
+      );
+    } else {
+      // discovery/global scan: still persist a light marker for transparency
+      for (const it of items) {
+        it.metrics = (it.metrics && typeof it.metrics === "object") ? it.metrics : {};
+        it.metrics.projectMatch = { strict: false, pass: true, score: 0.25, reasons: ["global_scan"], matched: [] };
+      }
+    }
+
     const platformCountsAfter = items.reduce((a, it) => {
       const p = safePlatform(it.platform);
       a[p] = (a[p] || 0) + 1;
@@ -467,18 +844,109 @@ app.post("/scan", requireAuth, async (req, res) => {
         })
         .slice(0, 10);
 
+      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
+      const trendGeos = STRICT_PROJECT_SCAN ? regionIso2.slice(0, 3) : [];
+
       await Promise.allSettled(
         candidates.map(async (it) => {
           const query = pickTrendsQuery(it);
           if (!query) return;
+
+          // Global signal (worldwide)
           const gt = await fetchGoogleTrendsSignal({
             query,
             geo: "",
             timeRange: "now 7-d",
           });
-          it.googleTrends = gt;
+
+          // Optional geo spread: how many selected regions show notable interest
+          let geoSpreadCount = 0;
+          let perGeoLatest = {};
+          if (gt?.ok && trendGeos.length) {
+            const settled = await Promise.allSettled(
+              trendGeos.map(async (geo) => {
+                const g = await fetchGoogleTrendsSignal({ query, geo, timeRange: "now 7-d" });
+                return { geo, g };
+              })
+            );
+            for (const s of settled) {
+              if (s.status !== "fulfilled") continue;
+              const { geo, g } = s.value;
+              if (g?.ok) {
+                perGeoLatest[geo] = Number(g.latest || 0);
+                if (Number(g.latest || 0) >= 10) geoSpreadCount += 1;
+              }
+            }
+          }
+
+          it.metrics = (it.metrics && typeof it.metrics === "object") ? it.metrics : {};
+          it.metrics.googleTrends = {
+            ok: !!gt?.ok,
+            query,
+            latest: Number(gt?.latest || 0),
+            delta1: Number(gt?.delta1 || 0), // lightweight interestDelta24h proxy
+            score01: Number(gt?.score01 || 0),
+            geoSpreadCount,
+            perGeoLatest,
+          };
+
+          it.googleTrends = gt; // kept for backward compatibility (not persisted)
         })
       );
+    }
+
+    // 4B) Optional: X/Twitter (No API) signal
+    // - Project scans only (STRICT_PROJECT_SCAN)
+    // - Read-only, cached, low frequency
+    // - Injects xSignal into item.metrics (affects momentumScore only in Base44)
+    const X_ENABLED = process.env.X_TRENDS_ENABLED !== "false";
+    let xSignalSnapshot = null;
+    if (X_ENABLED && STRICT_PROJECT_SCAN) {
+      const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
+      const xRegions = regionIso2.slice(0, 6); // cap regions for safety
+
+      if (xRegions.length) {
+        try {
+          const xRows = await fetchXTrends({
+            regions: xRegions,
+            limitPerRegion: 25,
+            ttlMs: 10 * 60 * 1000,
+            concurrency: 2,
+          });
+
+          // Build a compact snapshot for persistence across restarts.
+          // We keep only region+term+rank+volume (already capped by limitPerRegion).
+          xSignalSnapshot = {
+            v: 1,
+            ts: new Date().toISOString(),
+            source: "trends24",
+            regions: xRegions,
+            rows: xRows.map((r) => ({
+              region: String(r?.region || "").toUpperCase(),
+              term: String(r?.term || "").trim(),
+              rank: Number(r?.rank || 0),
+              volume: Number(r?.volume || 0),
+            })),
+          };
+
+          // attach lightweight xSignal to matching items (momentum-only)
+          attachXSignalsToItems({
+            items,
+            xRows,
+            projectId,
+            totalRegions: xRegions.length,
+            prevSnapshot: xPrevSnapshot,
+          });
+
+          console.log("🐦 X trends attached:", {
+            regions: xRegions,
+            rows: xRows.length,
+            itemsWithX: items.filter((it) => it?.metrics?.xSignal?.ok).length,
+          });
+        } catch (e) {
+          console.log("⚠️ X trends fetch/attach failed:", e?.message || e);
+        }
+      }
     }
 
     // 5) Comparable scoring (cross-platform)
@@ -511,6 +979,7 @@ app.post("/scan", requireAuth, async (req, res) => {
           trendRunId,
           projectId,
           items: storeItems,
+          ...(xSignalSnapshot ? { xSignalSnapshot } : {}),
         },
         { retries: 8, baseDelayMs: 900, maxDelayMs: 15_000 }
       );

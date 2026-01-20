@@ -31,6 +31,7 @@ function clamp01(x) {
  *   latest: 0..100,
  *   avg: 0..100,
  *   slope: -100..100 (rough),
+ *   delta1: -100..100 (latest - previous point),
  *   score01: 0..1
  * }
  */
@@ -68,7 +69,7 @@ export async function fetchGoogleTrendsSignal({
       .filter((n) => Number.isFinite(n));
 
     if (!values.length) {
-      const out = { ok: true, query: q, latest: 0, avg: 0, slope: 0, score01: 0 };
+      const out = { ok: true, query: q, latest: 0, avg: 0, slope: 0, delta1: 0, score01: 0 };
       cacheSet(cacheKey, out);
       return out;
     }
@@ -76,15 +77,17 @@ export async function fetchGoogleTrendsSignal({
     const latest = values[values.length - 1];
     const avg = values.reduce((a, b) => a + b, 0) / values.length;
 
-    // very rough slope: last - first
+    // rough slope: last - first
     const slope = values.length >= 2 ? (latest - values[0]) : 0;
+    // last-step delta (used as a lightweight "interestDelta24h" proxy)
+    const delta1 = values.length >= 2 ? (latest - values[values.length - 2]) : 0;
 
     // score01 combines level + growth
     const level01 = clamp01(latest / 100);
     const growth01 = clamp01((slope + 50) / 100); // slope -50..+50 -> 0..1-ish
     const score01 = clamp01(0.7 * level01 + 0.3 * growth01);
 
-    const out = { ok: true, query: q, latest, avg, slope, score01 };
+    const out = { ok: true, query: q, latest, avg, slope, delta1, score01 };
     cacheSet(cacheKey, out);
     return out;
   } catch (e) {
