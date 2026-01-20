@@ -109,7 +109,7 @@ async function postToBase44WithBackoff(url, payload, opts = {}) {
           "Content-Type": "application/json",
           "x-trendforge-secret": INGEST_SECRET,
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(deepCleanForUtf8(payload)),
       });
 
       const text = await resp.text();
@@ -398,13 +398,21 @@ app.post("/scan", requireAuth, async (req, res) => {
           console.error(`⚠️ GDELT failed (continuing): niche="${n}" region="${r}" ->`, msg.slice(0, 240));
         }
       }
-      const rssItems = await collectRss({
-        feeds: getRssFeedsForRegions(REGIONS),
-        // RSS doesn't support region targeting; include all niches as a single query string.
-        nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
-        maxPerFeed: 6,
-      });
+            let rssItems = [];
+      try {
+        rssItems = await collectRss({
+          feeds: getRssFeedsForRegions(REGIONS),
+          // RSS doesn't support region targeting; include all niches as a single query string.
+          nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
+          maxPerFeed: 6,
+        });
+      } catch (e) {
+        console.error("⚠️ RSS collector failed (continuing):", e?.message || e);
+        rssItems = [];
+      }
+
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
+
     }
 
     // 2) Normalize (NO scoring yet)
