@@ -15,24 +15,34 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
     const feedLanguage = typeof feed === "object" ? feed?.language : undefined;
     const feedPriority = typeof feed === "object" ? feed?.priority : undefined;
 
-    const res = await fetchWithRetry(feedUrl, { method: "GET" }, { retries: 2 });
-    if (!res.ok) continue;
+    let res;
+    let xml = "";
+    let data;
 
-    const xml = await res.text();
-    const data = parser.parse(xml);
+    try {
+      res = await fetchWithRetry(feedUrl, { method: "GET" }, { retries: 2 });
+      if (!res?.ok) continue;
+
+      xml = await res.text();
+      data = parser.parse(xml);
+    } catch (e) {
+      console.error(`⚠️ RSS feed failed (skipping): ${feedUrl} ->`, e?.message || e);
+      continue;
+    }
 
     const items =
-      data?.rss?.channel?.item ||
-      data?.feed?.entry ||
+      data?.rss?.channel?.item ??
+      data?.feed?.entry ??
       [];
 
     const arr = Array.isArray(items) ? items : [items];
 
     for (const it of arr.slice(0, maxPerFeed)) {
       const titleRaw = it?.title?.["#text"] ?? it?.title ?? "";
+
       const link =
         it?.link?.["@_href"] ??
-        it?.link ??
+        (typeof it?.link === "string" ? it.link : "") ??
         it?.guid ??
         "";
 
@@ -40,7 +50,6 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
 
       out.push({
         platform: "news",
-        // Decode entities + strip HTML (some feeds include \"&#8216;\" etc.)
         topicTitle: sanitizeText(toPlainString(titleRaw), { maxLen: 220 }),
         topicSummary: sanitizeText(toPlainString(summaryRaw), { maxLen: 700 }),
         sourceUrl: String(link).trim(),
@@ -58,5 +67,5 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
     }
   }
 
-  return out.filter(x => x.sourceUrl && x.topicTitle);
+  return out.filter((x) => x.sourceUrl && x.topicTitle);
 }
