@@ -4,6 +4,13 @@ import { sanitizeText, toPlainString } from "../utils/text.js";
 
 const parser = new XMLParser({ ignoreAttributes: false });
 
+function titleClean(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s#@'"’\-:.,!?()/&]/gu, "")
+    .trim();
+}
+
 function detectSocialHints(text) {
   const t = String(text || "").toLowerCase();
   // Deterministic keyword-based detection.

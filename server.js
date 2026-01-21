@@ -723,7 +723,9 @@ app.post("/scan", requireAuth, async (req, res) => {
 
   // Enforce 24h default unless explicitly overridden
   const windowHoursRaw = Number(watchlist?.windowHours || 24);
-  const windowHours = Math.max(1, Math.min(24, windowHoursRaw));
+  // ✅ HARD clamp windowHours to 24 for discovery (global + project)
+  const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
+
 
   // Respond immediately (async job style)
   res.json({ ok: true });
@@ -1054,6 +1056,28 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     // 5) Comparable scoring (cross-platform)
     scoreItemsComparable(items);
+    
+    // 🔗 INDIRECT SOCIAL PLATFORM CONFIRMATION
+    // Promote RSS socialHints + X matches into platform diversity signals
+    for (const it of items) {
+      it.metrics = it.metrics || {};
+
+      const social = it.metrics.socialHints || {};
+      const hasX = !!it.metrics.xSignal?.ok;
+
+      // Virtual platform confirmations (NO scraping, NO APIs)
+      it.metrics.indirectPlatforms = {
+        tiktok: !!social.tiktokMention,
+        instagram: !!social.instagramMention,
+        reels: !!social.reelsMention,
+        shorts: !!social.shortsMention,
+        x: hasX,
+      };
+
+      // Used later by Base44 topic aggregation
+      it.metrics.platformConfirmations = Object.values(it.metrics.indirectPlatforms)
+        .filter(Boolean).length;
+    }
 
     // 6) Sort by comparable score
     items.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
