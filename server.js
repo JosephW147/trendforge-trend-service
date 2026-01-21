@@ -831,14 +831,14 @@ app.post("/scan", requireAuth, async (req, res) => {
       console.log("▶ running news collectors (GDELT + RSS)");
       // Pull GDELT per-niche and per-region so regional filters apply.
       const gdeltItems = [];
-      const MAX_GDELT_COMBOS = 12;
+      const MAX_GDELT_COMBOS = 30;
       const combos = [];
       for (const n of NEWS_QUERIES) for (const r of REGIONS) combos.push({ n, r });
       for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
         try {
           const part = await withDeadline(
             collectGdelt({ nicheName: n, region: r, max: 25 }),
-            12_000,
+            25_000,
             'gdelt:${n}:${r}'
           );
           gdeltItems.push(...(part || []));
@@ -849,16 +849,21 @@ app.post("/scan", requireAuth, async (req, res) => {
           console.error(`⚠️ GDELT failed (continuing): niche="${n}" region="${r}" ->`, msg.slice(0, 240));
         }
       }
-            let rssItems = [];
+      
+      console.log("🗞️ GDELT count:", gdeltItems.length);
+
+      let rssItems = [];
       try {
         const queryFeeds = NEWS_QUERIES.length
-          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 30 })
           : [];
 
         const regionFeeds = getRssFeedsForRegions(REGIONS);
 
         // ✅ Always respect app/newsQueries when provided (Global + Project). Add regional feeds as backup.
-        const rssFeeds = queryFeeds.length ? [...queryFeeds, ...regionFeeds] : regionFeeds;
+        const rssFeeds = queryFeeds.length ? uniq([...queryFeeds, ...regionFeeds]).slice(0, 40) : regionFeeds;
+
+        console.log("📰 RSS feeds:", { query: queryFeeds.length, region: regionFeeds.length, total: rssFeeds.length });
 
         if (queryFeeds.length) {
           console.log(
@@ -880,6 +885,12 @@ app.post("/scan", requireAuth, async (req, res) => {
         console.error("⚠️ RSS collector failed (continuing):", e?.message || e);
         rssItems = [];
       }
+
+      console.log("🧾 collector counts:", {
+        gdelt: gdeltItems.length,
+        rss: rssItems.length,
+      });
+
 
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
 

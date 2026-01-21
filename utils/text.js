@@ -8,29 +8,56 @@ export function toPlainString(value) {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
 
-  // fast-xml-parser sometimes uses { "#text": "..." }
-  if (typeof value === "object") {
-    const v = value;
+  // Recursively extract text from objects/arrays (fast-xml-parser mixed content)
+  const seen = new Set();
+  const parts = [];
 
-    if (typeof v["#text"] === "string") return v["#text"];
-    if (typeof v.text === "string") return v.text;
-    if (typeof v.value === "string") return v.value;
-    if (typeof v.content === "string") return v.content;
-    if (typeof v.summary === "string") return v.summary;
-    if (typeof v.description === "string") return v.description;
+  const SKIP_KEYS = new Set([
+    "@_href", "@_src", "@_url", "@_type", "@_rel", "@_target", "@_id", "@_ref",
+    "@_xmlns", "@_version"
+  ]);
 
-    // Some feeds expose content as an array of strings
-    if (Array.isArray(v) && v.length) {
-      return v.map(toPlainString).filter(Boolean).join(" ");
+  function walk(v, keyHint = "") {
+    if (v == null) return;
+    if (typeof v === "string") {
+      const s = v.trim();
+      if (s) parts.push(s);
+      return;
+    }
+    if (typeof v === "number" || typeof v === "boolean") {
+      parts.push(String(v));
+      return;
+    }
+    if (typeof v !== "object") return;
+
+    if (seen.has(v)) return;
+    seen.add(v);
+
+    if (Array.isArray(v)) {
+      for (const item of v) walk(item);
+      return;
+    }
+
+    // Prefer #text only if it contains meaningful text
+    const t = typeof v["#text"] === "string" ? v["#text"].trim() : "";
+    if (t) {
+      parts.push(t);
+      // Don't return early; sometimes useful text exists elsewhere too
+    }
+
+    for (const [k, child] of Object.entries(v)) {
+      if (k === "#text") continue;
+      if (SKIP_KEYS.has(k)) continue;
+      if (k.startsWith("@_")) continue; // skip attributes broadly
+      walk(child, k);
     }
   }
 
-  // Last resort
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "";
-  }
+  walk(value);
+
+  // Join and de-dupe lightly
+  const joined = parts.join(" ").replace(/\s+/g, " ").trim();
+  return joined;
 }
 
 export function stripHtmlTags(input) {

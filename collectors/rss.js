@@ -90,7 +90,15 @@ export async function collectRss({
           "";
 
         const titleRaw = it?.title ?? "";
-        const summaryRaw = it?.description ?? it?.summary ?? it?.content ?? "";
+        const summaryRaw =
+          it?.description ??
+          it?.summary ??
+          it?.content ??
+          it?.["content:encoded"] ??
+          it?.["media:description"] ??
+          it?.["media:content"] ??
+          "";
+
 
         titleClean = sanitizeText(toPlainString(titleRaw), { maxLen: 220 });
         summaryClean = sanitizeText(toPlainString(summaryRaw), { maxLen: 700 });
