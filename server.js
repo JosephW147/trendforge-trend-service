@@ -389,6 +389,9 @@ function attachXSignalsToItems({ items, xRows, projectId, totalRegions, prevSnap
     const combined = normalizeTextLite(`${title} ${summary}`);
     const tags = new Set(extractHashtagsLite(`${title} ${summary}`));
 
+    // Token set for fuzzy matching (helps when X trend term is related but not a direct substring)
+    const itemTokens = new Set(combined.split(/\\s+/).filter(Boolean));
+
     let best = null;
     let bestScore = 0;
 
@@ -403,9 +406,23 @@ function attachXSignalsToItems({ items, xRows, projectId, totalRegions, prevSnap
 
       // phrase match
       if (bare && combined.includes(bare)) {
-        // Prefer tighter rank + more regions when ties.
         const score = 0.85;
         if (score > bestScore) { bestScore = score; best = a; }
+      } else {
+        // Fuzzy token overlap: allow related terms without strict substring match.
+        const termTokens = bare.split(/\\s+/).filter(Boolean);
+        if (termTokens.length >= 2) {
+          let hit = 0;
+          for (const t of termTokens) if (itemTokens.has(t)) hit++;
+          const jacc = hit / termTokens.length;
+          if (jacc >= 0.6) {
+            const score = 0.70;
+            if (score > bestScore) { bestScore = score; best = a; }
+          } else if (jacc >= 0.4) {
+            const score = 0.60;
+            if (score > bestScore) { bestScore = score; best = a; }
+          }
+        }
       }
     }
 
@@ -706,28 +723,34 @@ app.post("/scan", requireAuth, async (req, res) => {
     ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0)
   );
 
-  const isGlobalProject =
+  // ✅ Explicit scan mode from Base44 (preferred)
+  const scanModeRaw = String(req.body?.scanMode || "").trim().toUpperCase();
+  const forceGlobalDiscovery = scanModeRaw === "GLOBAL_DISCOVERY";
+  const forceProjectStrict = scanModeRaw === "PROJECT_STRICT";
+
+  // ✅ Robust Global project detection (ignore watchlist presence)
+  const isGlobalByHeuristic =
     NICHES.length === 1 &&
     String(NICHES[0] || "").trim().toLowerCase() === "global" &&
     REGIONS.length === 1 &&
-    String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
-    !hasWatchlist;
+    String(REGIONS[0] || "").trim().toLowerCase() === "global";
 
-  // Global project (Global/Global, no watchlist) => discovery mode
-  // Everything else => strict project mode
-  // Force Global project to stay discovery even if watchlist exists
-  const STRICT_PROJECT_SCAN = !isGlobalProject;
-  if (isGlobalProject) {
-    console.log("🌍 Global project detected -> forcing GLOBAL_DISCOVERY mode");
+  const isGlobalByEnv =
+    String(process.env.GLOBAL_PROJECT_ID || "").trim() &&
+    String(process.env.GLOBAL_PROJECT_ID).trim() === String(projectId);
+
+  const isGlobalProject = forceGlobalDiscovery || isGlobalByEnv || isGlobalByHeuristic;
+
+  // Global project => discovery mode (even if watchlist exists).
+  // Non-global projects => strict mode by default.
+  const STRICT_PROJECT_SCAN = forceProjectStrict ? true : !isGlobalProject;
+  if (isGlobalProject && !STRICT_PROJECT_SCAN) {
+    console.log("🌍 Global project detected -> GLOBAL_DISCOVERY mode", { scanModeRaw, hasWatchlist });
   }
 
-  // Enforce 24h default unless explicitly overridden
-  const windowHoursRaw = Number(watchlist?.windowHours || 24);
-  // ✅ HARD clamp windowHours to 24 for discovery (global + project)
-  const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
+  // ✅ Clamp scan window: allow up to 72h (TrendForge horizon) for discovery + watchlists
+  const windowHours = Math.max(1, Math.min(72, Number(watchlist?.windowHours || 24)));
 
-
-  // Respond immediately (async job style)
   res.json({ ok: true });
 
   try {
@@ -828,13 +851,20 @@ app.post("/scan", requireAuth, async (req, res) => {
       }
             let rssItems = [];
       try {
-        const rssFeeds =
-          STRICT_PROJECT_SCAN && NEWS_QUERIES.length
-            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
-            : getRssFeedsForRegions(REGIONS);
+        const queryFeeds = NEWS_QUERIES.length
+          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+          : [];
 
-        if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
-          console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
+        const regionFeeds = getRssFeedsForRegions(REGIONS);
+
+        // ✅ Always respect app/newsQueries when provided (Global + Project). Add regional feeds as backup.
+        const rssFeeds = queryFeeds.length ? [...queryFeeds, ...regionFeeds] : regionFeeds;
+
+        if (queryFeeds.length) {
+          console.log(
+            `📰 Using Google News RSS query feeds (${STRICT_PROJECT_SCAN ? "Project Scan" : "Global Scan"}):`,
+            queryFeeds.length
+          );
         }
 
         rssItems = await withDeadline(
@@ -1006,9 +1036,13 @@ app.post("/scan", requireAuth, async (req, res) => {
     // - Injects xSignal into item.metrics (affects momentumScore only in Base44)
     const X_ENABLED = process.env.X_TRENDS_ENABLED !== "false";
     let xSignalSnapshot = null;
-    if (X_ENABLED && STRICT_PROJECT_SCAN) {
+    if (X_ENABLED && (STRICT_PROJECT_SCAN || isGlobalProject || forceGlobalDiscovery)) {
       const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
-      const xRegions = regionIso2.slice(0, 6); // cap regions for safety
+
+// If we can't derive ISO2 regions (e.g. region="Global"), fall back to a small safe spread.
+// This avoids skipping X signals entirely on Global scans.
+const fallbackIso2 = ["US", "GB", "CA", "AU", "IN", "NG"];
+const xRegions = (regionIso2.length ? regionIso2 : fallbackIso2).slice(0, 6); // cap regions for safety
 
       if (xRegions.length) {
         try {
@@ -1243,4 +1277,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
-
