@@ -495,8 +495,8 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
       if (!ok) {
         return { pass: false, score: 0, reasons: ["region_mismatch"] };
       }
+      }
     }
-
     // 3) Negative keyword block (hard)
     for (const neg of negatives) {
       const n = normalizeTextLite(neg);
@@ -1169,4 +1169,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log('TrendForge Trend Service running on port ${PORT}')
 );
-}
+
