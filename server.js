@@ -18,10 +18,25 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// ---- Promise deadline guard (prevents long-hanging collectors from stalling scans) ----
+function withDeadline(promise, ms, label = "deadline") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label}:${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 // Base44 function to compute topics from TrendItems already stored for a TrendRun
 const BASE44_BUILD_TOPICS_URL =
   process.env.BASE44_BUILD_TOPICS_URL ||
   "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendTopicsFromRun";
+
+const BASE44_INGEST_URL =
+  process.env.BASE44_INGEST_URL ||
+  "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/ingestTrendResults";
+
 
 // ---- Env sanity ----
 if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
@@ -461,7 +476,7 @@ function buildProjectGate({ niches, newsQueries, watchlist, regions, windowHours
     .filter((r) => /^[A-Z]{2}$/i.test(r))
     .map((r) => r.toUpperCase());
 
-  const windowMs = Math.max(1, Number(windowHours || 72)) * 36e5;
+  const windowMs = Math.max(1, Number(windowHours || 24)) * 36e5;
 
   return function gateItem(item) {
     const reasons = [];
@@ -667,20 +682,44 @@ app.post("/scan", requireAuth, async (req, res) => {
     return "";
   };
   
-  // 🔍 DEBUG WATCHLIST CONTENT
+    // 🔍 DEBUG WATCHLIST CONTENT
   console.log("📋 watchlist received:", !!watchlist);
   console.log("watchlist.channels count:", watchlist?.channels?.length || 0);
   console.log("watchlist.keywords count:", watchlist?.keywords?.length || 0);
 
-
   if (!trendRunId) return res.status(400).send("Missing trendRunId");
   if (!projectId) return res.status(400).send("Missing projectId");
+
+  // ✅ Decide scan mode EARLY (so collectors can use it safely)
+  const hasWatchlist = !!(
+    watchlist &&
+    ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0)
+  );
+
+  const isGlobalProject =
+    NICHES.length === 1 &&
+    String(NICHES[0] || "").trim().toLowerCase() === "global" &&
+    REGIONS.length === 1 &&
+    String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
+    !hasWatchlist;
+
+  // Global project (Global/Global, no watchlist) => discovery mode
+  // Everything else => strict project mode
+  const STRICT_PROJECT_SCAN = !isGlobalProject;
+
+  // Enforce 24h default unless explicitly overridden
+  const windowHours = Number(watchlist?.windowHours || 24);
 
   // Respond immediately (async job style)
   res.json({ ok: true });
 
   try {
     console.log("✅ SCAN PIPELINE (YT + NEWS) running");
+    console.log("🧭 scanMode:", STRICT_PROJECT_SCAN ? "PROJECT_STRICT" : "GLOBAL_DISCOVERY", {
+      windowHours,
+      hasWatchlist,
+    });
+
 
     const requested = normalizeRequestedPlatforms(platforms);
     console.log("✅ Requested (normalized):", requested);
@@ -732,7 +771,7 @@ app.post("/scan", requireAuth, async (req, res) => {
                 watchlist,
                 region: r,
                 regionCode,
-              windowHours: watchlist?.windowHours || 72,
+              windowHours,
               maxPerChannel: Math.min(watchlist?.maxPerChannel || 10, 5), // 🔽 reduce
               maxPerKeyword: Math.min(watchlist?.maxPerKeyword || 10, 5), // 🔽 reduce
               });
@@ -814,18 +853,6 @@ app.post("/scan", requireAuth, async (req, res) => {
 
     // 3) Dedupe BEFORE scoring/trends
     items = dedupeByPlatformAndUrl(items);
-
-    // 3B) STRICT project-scan gating (Global scan stays discovery-oriented)
-    const hasWatchlist = !!(watchlist && ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0));
-    const isGlobalProject =
-      NICHES.length === 1 &&
-      String(NICHES[0] || "").trim().toLowerCase() === "global" &&
-      REGIONS.length === 1 &&
-      String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
-      !hasWatchlist;
-
-    const STRICT_PROJECT_SCAN = !isGlobalProject;
-    const windowHours = Number(watchlist?.windowHours || 24);
 
     if (STRICT_PROJECT_SCAN) {
       const gateItem = buildProjectGate({
@@ -1165,7 +1192,7 @@ try {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () =>
   console.log('TrendForge Trend Service running on port ${PORT}')
 );

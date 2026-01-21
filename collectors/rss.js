@@ -77,22 +77,26 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
 
       const link =
         it?.link?.["@_href"] ??
+        it?.link?.["#text"] ??
         (typeof it?.link === "string" ? it.link : "") ??
-        it?.guid ??
+        (typeof it?.guid === "string" ? it.guid : (it?.guid?.["#text"] ?? "")) ??
         "";
 
       const summaryRaw = it?.description ?? it?.summary ?? "";
 
-      const titleClean = sanitizeText(toPlainString(titleRaw), { maxLen: 220 });
-      const summaryClean = sanitizeText(toPlainString(summaryRaw), { maxLen: 700 });
-      const socialHints = detectSocialHints(`${titleClean} ${summaryClean}`);
+      // Google News RSS sometimes has no pubDate on some entries; fall back to "now"
+      const publishedAt =
+        it?.pubDate ??
+        it?.published ??
+        it?.updated ??
+        null;
 
       out.push({
         platform: "news",
         topicTitle: titleClean,
         topicSummary: summaryClean,
         sourceUrl: String(link).trim(),
-        publishedAt: it?.pubDate ?? it?.published ?? null,
+        publishedAt: publishedAt || new Date().toISOString(),
         author: it?.author?.name ?? it?.author ?? "",
         metrics: {
           feedUrl,
