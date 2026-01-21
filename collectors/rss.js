@@ -20,7 +20,12 @@ function detectSocialHints(text) {
   };
 }
 
-export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
+export async function collectRss({
+  feeds = [],
+  nicheName,
+  maxPerFeed = 6,
+  timeoutMs = 7000,
+}) {
   const out = [];
 
   for (const feed of feeds) {
@@ -31,83 +36,91 @@ export async function collectRss({ feeds = [], nicheName, maxPerFeed = 6 }) {
     const feedLanguage = typeof feed === "object" ? feed?.language : undefined;
     const feedPriority = typeof feed === "object" ? feed?.priority : undefined;
 
-    let res;
     let xml = "";
     let data;
 
     try {
-      res = await fetchWithRetry(
-        feedUrl,
-        {
-          method: "GET",
-          headers: {
-            // Many RSS hosts require a UA / Accept header to return content
-            "User-Agent": "TrendForgeRSS/1.0 (+https://trendforge-trend-service.onrender.com)",
-            "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.1",
-          },
-        },
-        { retries: 2, timeoutMs: 15000 }
-      );
-    } catch (e) {
-      console.log(`⚠️ RSS feed failed (skipping): ${feedUrl} ->`, e?.message || e);
-      continue;
-    }
+      // hard timeout per feed so scans don't stall for minutes
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!res?.ok) {
-      console.log(`⚠️ RSS feed non-OK (skipping): ${feedUrl} -> ${res?.status}`);
-      continue;
-    }
-    try {
-      xml = await res.text();
+      try {
+        const res = await fetchWithRetry(feedUrl, {
+          headers: { "User-Agent": "TrendForgeBot/1.0 (+https://trendforge.app)" },
+          signal: controller.signal,
+        });
+        xml = await res.text();
+      } finally {
+        clearTimeout(t);
+      }
+
       data = parser.parse(xml);
     } catch (e) {
-      console.log(`⚠️ RSS parse failed (skipping): ${feedUrl} ->`, e?.message || e);
+      console.error("⚠️ RSS feed failed (skipping):", feedUrl, "->", e?.message || e);
       continue;
     }
 
-    const items =
-      data?.rss?.channel?.item ??
-      data?.feed?.entry ??
+    // Pull items out of either rss/channel/item or feed/entry shapes
+    const rssItems =
+      data?.rss?.channel?.item ||
+      data?.channel?.item ||
+      data?.feed?.entry ||
       [];
 
-    const arr = Array.isArray(items) ? items : [items];
+    const items = Array.isArray(rssItems) ? rssItems : [rssItems];
 
-    for (const it of arr.slice(0, maxPerFeed)) {
-      const titleRaw = it?.title?.["#text"] ?? it?.title ?? "";
+    for (const it of items.slice(0, maxPerFeed)) {
+      // IMPORTANT: define these OUTSIDE try so they always exist
+      let titleClean = "";
+      let summaryClean = "";
 
-      const link =
-        it?.link?.["@_href"] ??
-        it?.link?.["#text"] ??
-        (typeof it?.link === "string" ? it.link : "") ??
-        (typeof it?.guid === "string" ? it.guid : (it?.guid?.["#text"] ?? "")) ??
-        "";
+      try {
+        const link =
+          it?.link?.["@_href"] ||
+          it?.link?.href ||
+          it?.link ||
+          it?.guid ||
+          "";
 
-      const summaryRaw = it?.description ?? it?.summary ?? "";
+        const titleRaw = it?.title ?? "";
+        const summaryRaw = it?.description ?? it?.summary ?? it?.content ?? "";
 
-      // Google News RSS sometimes has no pubDate on some entries; fall back to "now"
-      const publishedAt =
-        it?.pubDate ??
-        it?.published ??
-        it?.updated ??
-        null;
+        titleClean = sanitizeText(toPlainString(titleRaw), { maxLen: 220 });
+        summaryClean = sanitizeText(toPlainString(summaryRaw), { maxLen: 700 });
 
-      out.push({
-        platform: "news",
-        topicTitle: titleClean,
-        topicSummary: summaryClean,
-        sourceUrl: String(link).trim(),
-        publishedAt: publishedAt || new Date().toISOString(),
-        author: it?.author?.name ?? it?.author ?? "",
-        metrics: {
+        if (!link || !titleClean) continue;
+
+        const socialHints = detectSocialHints(`${titleClean} ${summaryClean}`);
+
+        out.push({
+          platform: "news",
+          topicTitle: titleClean,
+          topicSummary: summaryClean,
+          sourceUrl: String(link).trim(),
+          publishedAt: it?.pubDate ?? it?.published ?? it?.updated ?? null,
+          author: it?.author?.name ?? it?.author ?? "",
+          metrics: {
+            feedUrl,
+            rss: true,
+            socialHints,
+            ...(feedRegion ? { feedRegion } : {}),
+            ...(feedLanguage ? { language: feedLanguage } : {}),
+            ...(feedPriority ? { sourcePriority: feedPriority } : {}),
+          },
+          queryUsed: nicheName,
+        });
+      } catch (e) {
+        // never reference undeclared vars here again
+        console.error(
+          "⚠️ RSS item parse failed (skipping):",
           feedUrl,
-          rss: true,
-          socialHints,
-          ...(feedRegion ? { feedRegion } : {}),
-          ...(feedLanguage ? { language: feedLanguage } : {}),
-          ...(feedPriority ? { sourcePriority: feedPriority } : {}),
-        },
-        queryUsed: nicheName,
-      });
+          "title=",
+          titleClean || "(unavailable)",
+          "->",
+          e?.message || e
+        );
+        continue;
+      }
     }
   }
 

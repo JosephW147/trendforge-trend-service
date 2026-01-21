@@ -671,10 +671,20 @@ app.post("/scan", requireAuth, async (req, res) => {
 
   const NICHES = uniq(nicheList);
   const REGIONS = uniq(regionList);
+  
+  function sanitizeGdeltQuery(q) {
+    const toks = String(q || "")
+      .trim()
+      .split(/\s+/)
+      // Drop tiny tokens like "AI" that trigger GDELT "keyword too short"
+      .filter((t) => t.length >= 3);
+    return toks.join(" ").trim();
+  }
 
   const NEWS_QUERIES = uniq(Array.isArray(newsQueries) ? newsQueries : NICHES)
-    .map((q) => String(q || "").trim())
+    .map((q) => sanitizeGdeltQuery(q))
     .filter((q) => q.length >= 4);
+
 
   const regionCodeFrom = (r) => {
     const s = String(r || "").trim();
@@ -705,10 +715,15 @@ app.post("/scan", requireAuth, async (req, res) => {
 
   // Global project (Global/Global, no watchlist) => discovery mode
   // Everything else => strict project mode
+  // Force Global project to stay discovery even if watchlist exists
   const STRICT_PROJECT_SCAN = !isGlobalProject;
+  if (isGlobalProject) {
+    console.log("🌍 Global project detected -> forcing GLOBAL_DISCOVERY mode");
+  }
 
   // Enforce 24h default unless explicitly overridden
-  const windowHours = Number(watchlist?.windowHours || 24);
+  const windowHoursRaw = Number(watchlist?.windowHours || 24);
+  const windowHours = Math.max(1, Math.min(24, windowHoursRaw));
 
   // Respond immediately (async job style)
   res.json({ ok: true });
@@ -796,7 +811,11 @@ app.post("/scan", requireAuth, async (req, res) => {
       for (const n of NEWS_QUERIES) for (const r of REGIONS) combos.push({ n, r });
       for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
         try {
-          const part = await collectGdelt({ nicheName: n, region: r, max: 25 });
+          const part = await withDeadline(
+            collectGdelt({ nicheName: n, region: r, max: 25 }),
+            12_000,
+            'gdelt:${n}:${r}'
+          );
           gdeltItems.push(...(part || []));
         } catch (e) {
           // GDELT occasionally replies with 200 + plain text (non-JSON) or a throttling message.
@@ -816,11 +835,15 @@ app.post("/scan", requireAuth, async (req, res) => {
           console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
         }
 
-        rssItems = await collectRss({
-          feeds: rssFeeds,
-          nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
-          maxPerFeed: 6,
-        });
+        rssItems = await withDeadline(
+          collectRss({
+            feeds: rssFeeds.slice(0, 8),     // hard cap feeds
+            nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
+            maxPerFeed: 4,                   // smaller per-feed pull
+          }),
+          15_000,
+          "rss"
+        );
       } catch (e) {
         console.error("⚠️ RSS collector failed (continuing):", e?.message || e);
         rssItems = [];
@@ -1193,7 +1216,7 @@ try {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log('TrendForge Trend Service running on port ${PORT}')
-);
+app.listen(PORT, () => {
+  console.log(`TrendForge Trend Service running on port ${PORT}`);
+});
 
