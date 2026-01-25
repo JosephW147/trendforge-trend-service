@@ -389,9 +389,6 @@ function attachXSignalsToItems({ items, xRows, projectId, totalRegions, prevSnap
     const combined = normalizeTextLite(`${title} ${summary}`);
     const tags = new Set(extractHashtagsLite(`${title} ${summary}`));
 
-    // Token set for fuzzy matching (helps when X trend term is related but not a direct substring)
-    const itemTokens = new Set(combined.split(/\\s+/).filter(Boolean));
-
     let best = null;
     let bestScore = 0;
 
@@ -406,23 +403,9 @@ function attachXSignalsToItems({ items, xRows, projectId, totalRegions, prevSnap
 
       // phrase match
       if (bare && combined.includes(bare)) {
+        // Prefer tighter rank + more regions when ties.
         const score = 0.85;
         if (score > bestScore) { bestScore = score; best = a; }
-      } else {
-        // Fuzzy token overlap: allow related terms without strict substring match.
-        const termTokens = bare.split(/\\s+/).filter(Boolean);
-        if (termTokens.length >= 2) {
-          let hit = 0;
-          for (const t of termTokens) if (itemTokens.has(t)) hit++;
-          const jacc = hit / termTokens.length;
-          if (jacc >= 0.6) {
-            const score = 0.70;
-            if (score > bestScore) { bestScore = score; best = a; }
-          } else if (jacc >= 0.4) {
-            const score = 0.60;
-            if (score > bestScore) { bestScore = score; best = a; }
-          }
-        }
       }
     }
 
@@ -723,34 +706,28 @@ app.post("/scan", requireAuth, async (req, res) => {
     ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0)
   );
 
-  // ✅ Explicit scan mode from Base44 (preferred)
-  const scanModeRaw = String(req.body?.scanMode || "").trim().toUpperCase();
-  const forceGlobalDiscovery = scanModeRaw === "GLOBAL_DISCOVERY";
-  const forceProjectStrict = scanModeRaw === "PROJECT_STRICT";
-
-  // ✅ Robust Global project detection (ignore watchlist presence)
-  const isGlobalByHeuristic =
+  const isGlobalProject =
     NICHES.length === 1 &&
     String(NICHES[0] || "").trim().toLowerCase() === "global" &&
     REGIONS.length === 1 &&
-    String(REGIONS[0] || "").trim().toLowerCase() === "global";
+    String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
+    !hasWatchlist;
 
-  const isGlobalByEnv =
-    String(process.env.GLOBAL_PROJECT_ID || "").trim() &&
-    String(process.env.GLOBAL_PROJECT_ID).trim() === String(projectId);
-
-  const isGlobalProject = forceGlobalDiscovery || isGlobalByEnv || isGlobalByHeuristic;
-
-  // Global project => discovery mode (even if watchlist exists).
-  // Non-global projects => strict mode by default.
-  const STRICT_PROJECT_SCAN = forceProjectStrict ? true : !isGlobalProject;
-  if (isGlobalProject && !STRICT_PROJECT_SCAN) {
-    console.log("🌍 Global project detected -> GLOBAL_DISCOVERY mode", { scanModeRaw, hasWatchlist });
+  // Global project (Global/Global, no watchlist) => discovery mode
+  // Everything else => strict project mode
+  // Force Global project to stay discovery even if watchlist exists
+  const STRICT_PROJECT_SCAN = !isGlobalProject;
+  if (isGlobalProject) {
+    console.log("🌍 Global project detected -> forcing GLOBAL_DISCOVERY mode");
   }
 
-  // ✅ Clamp scan window: allow up to 72h (TrendForge horizon) for discovery + watchlists
-  const windowHours = Math.max(1, Math.min(72, Number(watchlist?.windowHours || 24)));
+  // Enforce 24h default unless explicitly overridden
+  const windowHoursRaw = Number(watchlist?.windowHours || 24);
+  // ✅ HARD clamp windowHours to 24 for discovery (global + project)
+  const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
 
+
+  // Respond immediately (async job style)
   res.json({ ok: true });
 
   try {
@@ -851,20 +828,13 @@ app.post("/scan", requireAuth, async (req, res) => {
       }
             let rssItems = [];
       try {
-        const queryFeeds = NEWS_QUERIES.length
-          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
-          : [];
+        const rssFeeds =
+          STRICT_PROJECT_SCAN && NEWS_QUERIES.length
+            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+            : getRssFeedsForRegions(REGIONS);
 
-        const regionFeeds = getRssFeedsForRegions(REGIONS);
-
-        // ✅ Always respect app/newsQueries when provided (Global + Project). Add regional feeds as backup.
-        const rssFeeds = queryFeeds.length ? [...queryFeeds, ...regionFeeds] : regionFeeds;
-
-        if (queryFeeds.length) {
-          console.log(
-            `📰 Using Google News RSS query feeds (${STRICT_PROJECT_SCAN ? "Project Scan" : "Global Scan"}):`,
-            queryFeeds.length
-          );
+        if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
+          console.log("📰 Using Google News RSS feeds (Project Scan):", rssFeeds.length);
         }
 
         rssItems = await withDeadline(
@@ -1036,13 +1006,9 @@ app.post("/scan", requireAuth, async (req, res) => {
     // - Injects xSignal into item.metrics (affects momentumScore only in Base44)
     const X_ENABLED = process.env.X_TRENDS_ENABLED !== "false";
     let xSignalSnapshot = null;
-    if (X_ENABLED && (STRICT_PROJECT_SCAN || isGlobalProject || forceGlobalDiscovery)) {
+    if (X_ENABLED && STRICT_PROJECT_SCAN) {
       const regionIso2 = uniq(REGIONS.map(regionCodeFrom)).filter(Boolean);
-
-// If we can't derive ISO2 regions (e.g. region="Global"), fall back to a small safe spread.
-// This avoids skipping X signals entirely on Global scans.
-const fallbackIso2 = ["US", "GB", "CA", "AU", "IN", "NG"];
-const xRegions = (regionIso2.length ? regionIso2 : fallbackIso2).slice(0, 6); // cap regions for safety
+      const xRegions = regionIso2.slice(0, 6); // cap regions for safety
 
       if (xRegions.length) {
         try {
@@ -1197,49 +1163,9 @@ const xRegions = (regionIso2.length ? regionIso2 : fallbackIso2).slice(0, 6); //
       }
     }
 
-    // Balanced store pool (prevents one platform dominating the 60 stored items)
-// Strategy:
-// - First pass: take up to cap per platform (in overall score order)
-// - Second pass: fill remaining slots with best remaining items
-function selectStorePool(sortedItems, maxTotal, capsByPlatform) {
-  const selected = [];
-  const seen = new Set();
-  const counts = {};
-  const cap = (p) => (capsByPlatform && capsByPlatform[p] != null) ? capsByPlatform[p] : maxTotal;
-
-  for (const it of sortedItems) {
-    if (selected.length >= maxTotal) break;
-    const id = String(it?.id || it?._id || it?.clusterId || it?.sourceUrl || Math.random());
-    if (seen.has(id)) continue;
-    const p = String(it?.platform || "unknown").toLowerCase().trim();
-    const n = counts[p] || 0;
-    if (n >= cap(p)) continue;
-    selected.push(it);
-    seen.add(id);
-    counts[p] = n + 1;
-  }
-
-  if (selected.length < maxTotal) {
-    for (const it of sortedItems) {
-      if (selected.length >= maxTotal) break;
-      const id = String(it?.id || it?._id || it?.clusterId || it?.sourceUrl || Math.random());
-      if (seen.has(id)) continue;
-      selected.push(it);
-      seen.add(id);
-      const p = String(it?.platform || "unknown").toLowerCase().trim();
-      counts[p] = (counts[p] || 0) + 1;
-    }
-  }
-
-  return { selected, counts };
-}
-
     // 7) STORE pool (important for Base44 topic building)
     const MAX_STORE = 60;
-    const STORE_PLATFORM_CAPS = { youtube: 30, news: 30 };
-    const { selected: storeItems, counts: storeCounts } = selectStorePool(items, MAX_STORE, STORE_PLATFORM_CAPS);
-
-    console.log("📦 STORE platformCounts:", storeCounts);
+    const storeItems = items.slice(0, MAX_STORE);
 
     console.log("✅ STORE TrendItems count:", storeItems.length);
 
@@ -1266,14 +1192,32 @@ function selectStorePool(sortedItems, maxTotal, capsByPlatform) {
       // If Base44 is down/flaky, fail gracefully and mark the run error
       throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
     }
+
+
+
+    const storeCounts = storeItems.reduce((a, it) => {
+      const p = safePlatform(it.platform);
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
     console.log("📦 STORE platformCounts:", storeCounts);
 
     // 9) Build TrendTopics in Base44 from stored TrendItems
     console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 try {
+  // LLM summary backfill config passed to the Base44 function (server-to-server).
+  // Keeps Base44 functions working now, and makes migration away from Base44 easier later.
+  const SUMMARY_LLM = {
+    enabled: String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false",
+    model: process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini",
+    apiKey: process.env.OPENAI_API_KEY || "",
+    max: Number(process.env.SUMMARY_LLM_MAX || 20),
+    fetchMeta: String(process.env.SUMMARY_LLM_FETCH_META || "false") === "true",
+  };
+
   const topicsResp = await postToBase44WithBackoff(
     BASE44_BUILD_TOPICS_URL,
-    { trendRunId, projectId }, // include projectId (harmless if ignored)
+    { trendRunId, projectId, SUMMARY_LLM }, // include projectId (harmless if ignored)
     { retries: 7, baseDelayMs: 900, maxDelayMs: 12_000 }
   );
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
@@ -1309,3 +1253,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
+
