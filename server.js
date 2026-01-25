@@ -1225,22 +1225,125 @@ console.log("🕒 windowHours resolved:", {
     // 9) Build TrendTopics in Base44 from stored TrendItems
     console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 try {
-  // LLM summary backfill config passed to the Base44 function (server-to-server).
-  // Keeps Base44 functions working now, and makes migration away from Base44 easier later.
-  const SUMMARY_LLM = {
-    enabled: String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false",
-    model: process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini",
-    apiKey: process.env.OPENAI_API_KEY || "",
-    max: Number(process.env.SUMMARY_LLM_MAX || 20),
-    fetchMeta: String(process.env.SUMMARY_LLM_FETCH_META || "false") === "true",
-  };
+  console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 
-  const topicsResp = await postToBase44WithBackoff(
+  // Build topics in Base44 (pure clustering/scoring, no LLM here)
+  const topicsResp = await postJson(
     BASE44_BUILD_TOPICS_URL,
-    { trendRunId, projectId, SUMMARY_LLM }, // include projectId (harmless if ignored)
-    { retries: 7, baseDelayMs: 900, maxDelayMs: 12_000 }
+    {
+      trendRunId,
+      projectId,
+      maxTopics: 60,
+    },
+    {
+      headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` },
+      retries: 7,
+      baseDelayMs: 900,
+      traceId,
+    }
   );
+
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
+
+  // ---- LLM summary backfill (Render backend -> OpenAI -> Base44 update) ----
+  // We do this here (in Render) so the same logic works when you later migrate away from Base44.
+  const SUMMARY_LLM_ENABLED = String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false";
+  const SUMMARY_LLM_MODEL = process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini";
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+  if (SUMMARY_LLM_ENABLED && OPENAI_API_KEY) {
+    const base44Base = BASE44_BUILD_TOPICS_URL.split("/functions/")[0] + "/functions";
+    const LIST_TOPICS_URL = `${base44Base}/listTrendTopicsByRun`;
+    const UPDATE_TOPIC_URL = `${base44Base}/updateTrendTopicSummary`;
+
+    const safeJsonArray = (s) => {
+      try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; }
+    };
+
+    const listResp = await postJson(
+      LIST_TOPICS_URL,
+      { trendRunId, projectId },
+      { headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` }, retries: 3, baseDelayMs: 500, traceId }
+    );
+
+    const topics = Array.isArray(listResp?.topics) ? listResp.topics : [];
+    const missing = topics.filter((t) => !String(t.summary || "").trim());
+
+    // Backfill up to 30 per run to avoid long scans
+    const toFill = missing.slice(0, 30);
+
+    const summarizeOne = async (t) => {
+      const title = String(t.canonicalTitle || "").slice(0, 200);
+      const keywords = safeJsonArray(t.keywordsJson).slice(0, 12).join(", ");
+      const platforms = (() => {
+        try {
+          const c = JSON.parse(t.platformCountsJson || "{}");
+          return Object.keys(c).filter((k) => c[k] > 0).join(", ");
+        } catch { return ""; }
+      })();
+
+      const prompt =
+        `Write a concise 1–2 sentence news-style summary for a trending topic. ` +
+        `Do not use hashtags. Do not include links. Be factual and neutral. ` +
+        `Title: ${title}
+` +
+        (keywords ? `Keywords: ${keywords}
+` : "") +
+        (platforms ? `Platforms: ${platforms}
+` : "");
+
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: SUMMARY_LLM_MODEL,
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: "You generate short, factual summaries for trend dashboards." },
+            { role: "user", content: prompt },
+          ],
+        }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        throw new Error(`OpenAI summary failed ${resp.status}: ${errText}`);
+      }
+      const data = await resp.json();
+      const summary = String(data?.choices?.[0]?.message?.content || "").trim();
+      return summary;
+    };
+
+    let attempted = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    for (const t of toFill) {
+      attempted++;
+      try {
+        const summary = await summarizeOne(t);
+        if (!summary) { skipped++; continue; }
+
+        await postJson(
+          UPDATE_TOPIC_URL,
+          { topicId: t.id || t.topicId, summary, llmNotes: "LLM backfill (Render)" },
+          { headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` }, retries: 3, baseDelayMs: 400, traceId }
+        );
+
+        updated++;
+      } catch (e) {
+        console.warn("⚠️ topic summary backfill failed:", e?.message || e);
+        skipped++;
+      }
+    }
+
+    console.log("🧠 Topic summary backfill:", { attempted, updated, skipped });
+  } else {
+    console.log("🧠 Topic summary backfill skipped:", { SUMMARY_LLM_ENABLED, hasKey: Boolean(OPENAI_API_KEY) });
+  }
 } catch (e) {
   console.error("❌ Base44 buildTrendTopicsFromRun failed (after retries):", e?.message || e);
 
