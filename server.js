@@ -180,6 +180,12 @@ async function postToBase44WithBackoff(url, payload, opts = {}) {
   throw lastErr || new Error("Base44 call failed (unknown)");
 }
 
+// Simple JSON POST helper used by some callers (alias of postToBase44WithBackoff).
+// Keeps older code paths working if they call postJson().
+async function postJson(url, payload, opts = {}) {
+  return postToBase44WithBackoff(url, payload, opts);
+}
+
 // ✅ Normalize requested platforms (treat legacy socials as "news" if they appear)
 function normalizeRequestedPlatforms(input = []) {
   const set = new Set((input || []).map((p) => String(p).toLowerCase().trim()));
@@ -706,19 +712,12 @@ app.post("/scan", requireAuth, async (req, res) => {
     ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0)
   );
 
-  const isGlobalProject = (
+  const isGlobalProject =
     NICHES.length === 1 &&
     String(NICHES[0] || "").trim().toLowerCase() === "global" &&
     REGIONS.length === 1 &&
-    String(REGIONS[0] || "").trim().toLowerCase() === "global" ); // && !hasWatchlist;
-
-  // Global should ALWAYS be GLOBAL_DISCOVERY (even if it has a watchlist)
-  const scanMode = isGlobalProject ? "GLOBAL_DISCOVERY" : scanModeRaw;
-
-  // Global uses 72h by default (or watchlist windowHours), Projects can be shorter
-  //const windowHours = isGlobalProject
-  //  ? Number((watchlist?.windowHours || 72))
- //   : Number((watchlist?.windowHours || 24));
+    String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
+    !hasWatchlist;
 
   // Global project (Global/Global, no watchlist) => discovery mode
   // Everything else => strict project mode
@@ -729,9 +728,9 @@ app.post("/scan", requireAuth, async (req, res) => {
   }
 
   // Enforce 24h default unless explicitly overridden
-  // const windowHoursRaw = Number(watchlist?.windowHours || 24);
+  const windowHoursRaw = Number(watchlist?.windowHours || 24);
   // ✅ HARD clamp windowHours to 24 for discovery (global + project)
-  //const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
+  // const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
 
   let windowHours = isGlobalProject
     ? Number(watchlist?.windowHours || 72)
