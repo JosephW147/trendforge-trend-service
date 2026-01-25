@@ -831,14 +831,14 @@ app.post("/scan", requireAuth, async (req, res) => {
       console.log("▶ running news collectors (GDELT + RSS)");
       // Pull GDELT per-niche and per-region so regional filters apply.
       const gdeltItems = [];
-      const MAX_GDELT_COMBOS = 30;
+      const MAX_GDELT_COMBOS = 12;
       const combos = [];
       for (const n of NEWS_QUERIES) for (const r of REGIONS) combos.push({ n, r });
       for (const { n, r } of combos.slice(0, MAX_GDELT_COMBOS)) {
         try {
           const part = await withDeadline(
             collectGdelt({ nicheName: n, region: r, max: 25 }),
-            25_000,
+            12_000,
             'gdelt:${n}:${r}'
           );
           gdeltItems.push(...(part || []));
@@ -849,21 +849,16 @@ app.post("/scan", requireAuth, async (req, res) => {
           console.error(`⚠️ GDELT failed (continuing): niche="${n}" region="${r}" ->`, msg.slice(0, 240));
         }
       }
-      
-      console.log("🗞️ GDELT count:", gdeltItems.length);
-
-      let rssItems = [];
+            let rssItems = [];
       try {
         const queryFeeds = NEWS_QUERIES.length
-          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 30 })
+          ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
           : [];
 
         const regionFeeds = getRssFeedsForRegions(REGIONS);
 
         // ✅ Always respect app/newsQueries when provided (Global + Project). Add regional feeds as backup.
-        const rssFeeds = queryFeeds.length ? uniq([...queryFeeds, ...regionFeeds]).slice(0, 40) : regionFeeds;
-
-        console.log("📰 RSS feeds:", { query: queryFeeds.length, region: regionFeeds.length, total: rssFeeds.length });
+        const rssFeeds = queryFeeds.length ? [...queryFeeds, ...regionFeeds] : regionFeeds;
 
         if (queryFeeds.length) {
           console.log(
@@ -885,12 +880,6 @@ app.post("/scan", requireAuth, async (req, res) => {
         console.error("⚠️ RSS collector failed (continuing):", e?.message || e);
         rssItems = [];
       }
-
-      console.log("🧾 collector counts:", {
-        gdelt: gdeltItems.length,
-        rss: rssItems.length,
-      });
-
 
       rawItems.push(...(gdeltItems || []), ...(rssItems || []));
 
@@ -1208,9 +1197,49 @@ const xRegions = (regionIso2.length ? regionIso2 : fallbackIso2).slice(0, 6); //
       }
     }
 
+    // Balanced store pool (prevents one platform dominating the 60 stored items)
+// Strategy:
+// - First pass: take up to cap per platform (in overall score order)
+// - Second pass: fill remaining slots with best remaining items
+function selectStorePool(sortedItems, maxTotal, capsByPlatform) {
+  const selected = [];
+  const seen = new Set();
+  const counts = {};
+  const cap = (p) => (capsByPlatform && capsByPlatform[p] != null) ? capsByPlatform[p] : maxTotal;
+
+  for (const it of sortedItems) {
+    if (selected.length >= maxTotal) break;
+    const id = String(it?.id || it?._id || it?.clusterId || it?.sourceUrl || Math.random());
+    if (seen.has(id)) continue;
+    const p = String(it?.platform || "unknown").toLowerCase().trim();
+    const n = counts[p] || 0;
+    if (n >= cap(p)) continue;
+    selected.push(it);
+    seen.add(id);
+    counts[p] = n + 1;
+  }
+
+  if (selected.length < maxTotal) {
+    for (const it of sortedItems) {
+      if (selected.length >= maxTotal) break;
+      const id = String(it?.id || it?._id || it?.clusterId || it?.sourceUrl || Math.random());
+      if (seen.has(id)) continue;
+      selected.push(it);
+      seen.add(id);
+      const p = String(it?.platform || "unknown").toLowerCase().trim();
+      counts[p] = (counts[p] || 0) + 1;
+    }
+  }
+
+  return { selected, counts };
+}
+
     // 7) STORE pool (important for Base44 topic building)
     const MAX_STORE = 60;
-    const storeItems = items.slice(0, MAX_STORE);
+    const STORE_PLATFORM_CAPS = { youtube: 30, news: 30 };
+    const { selected: storeItems, counts: storeCounts } = selectStorePool(items, MAX_STORE, STORE_PLATFORM_CAPS);
+
+    console.log("📦 STORE platformCounts:", storeCounts);
 
     console.log("✅ STORE TrendItems count:", storeItems.length);
 
@@ -1237,14 +1266,6 @@ const xRegions = (regionIso2.length ? regionIso2 : fallbackIso2).slice(0, 6); //
       // If Base44 is down/flaky, fail gracefully and mark the run error
       throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
     }
-
-
-
-    const storeCounts = storeItems.reduce((a, it) => {
-      const p = safePlatform(it.platform);
-      a[p] = (a[p] || 0) + 1;
-      return a;
-    }, {});
     console.log("📦 STORE platformCounts:", storeCounts);
 
     // 9) Build TrendTopics in Base44 from stored TrendItems
