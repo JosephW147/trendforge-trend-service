@@ -80,14 +80,19 @@ function deepCleanForUtf8(x) {
   return x;
 }
 function buildGoogleNewsRssFeeds(queries, opts = {}) {
-  const { hl = "en-US", gl = "US", ceid = "US:en", limit = 12 } = opts;
+  const { hl = "en-US", gl = "US", ceid = "US:en", limit = 12, windowHours = 24 } = opts;
 
   const uniq = (arr) => [...new Set((arr || []).map((x) => String(x || "").trim()).filter(Boolean))];
+
+  // Google News RSS search can return older items unless we add a recency hint.
+  // We align the hint with windowHours (24h -> when:1d, 72h -> when:3d, etc.).
+  const days = Math.max(1, Math.min(7, Math.ceil(Number(windowHours || 24) / 24)));
 
   return uniq(queries)
     .slice(0, Math.max(5, Math.min(limit, 12)))
     .map((q) => {
-      const encoded = encodeURIComponent(q);
+      const qWithWhen = `${q} when:${days}d`;
+      const encoded = encodeURIComponent(qWithWhen);
       return `https://news.google.com/rss/search?q=${encoded}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
     });
 }
@@ -772,19 +777,31 @@ app.post("/scan", requireAuth, async (req, res) => {
     ((watchlist.channels?.length || 0) + (watchlist.keywords?.length || 0) > 0)
   );
 
-  const isGlobalProject =
+  // --- Global scan vs Project scan ---
+  // You want GLOBAL scans (Global/Global) to stay discovery even when a watchlist is present.
+  // Project STRICT scans are reserved for the per-project "Trend Scan" button.
+  const scanModeRaw = String(scanMode || "").trim();
+  const scanModeNorm = scanModeRaw.toUpperCase();
+
+  const isGlobalNicheRegion =
     NICHES.length === 1 &&
     String(NICHES[0] || "").trim().toLowerCase() === "global" &&
     REGIONS.length === 1 &&
-    String(REGIONS[0] || "").trim().toLowerCase() === "global" &&
-    !hasWatchlist;
+    String(REGIONS[0] || "").trim().toLowerCase() === "global";
 
-  // Global project (Global/Global, no watchlist) => discovery mode
-  // Everything else => strict project mode
-  // Force Global project to stay discovery even if watchlist exists
-  const STRICT_PROJECT_SCAN = !isGlobalProject;
+  const GLOBAL_PROJECT_ID = (process.env.GLOBAL_PROJECT_ID || "").trim();
+  const isGlobalProject = isGlobalNicheRegion || (GLOBAL_PROJECT_ID && projectId === GLOBAL_PROJECT_ID);
+
+  // If Base44 sends scanMode, respect it *except* we always force global project to discovery.
+  const requestedStrict = scanModeNorm === "PROJECT_STRICT" || scanModeNorm === "STRICT";
+  const STRICT_PROJECT_SCAN = isGlobalProject ? false : requestedStrict;
+
   if (isGlobalProject) {
-    console.log("🌍 Global project detected -> forcing GLOBAL_DISCOVERY mode");
+    console.log("🌍 Global scan detected -> forcing GLOBAL_DISCOVERY mode", {
+      scanModeRaw,
+      hasWatchlist,
+      projectId,
+    });
   }
 
   // Enforce 24h default unless explicitly overridden
@@ -792,13 +809,12 @@ app.post("/scan", requireAuth, async (req, res) => {
   // ✅ HARD clamp windowHours to 24 for discovery (global + project)
   // const windowHours = Math.max(1, Math.min(24, Number(watchlist?.windowHours || 24)));
 
-  let windowHours = isGlobalProject
-    ? Number(watchlist?.windowHours || 72)
-    : Number(watchlist?.windowHours || 24);
-
-if (!isGlobalProject) {
-  windowHours = Math.max(1, Math.min(24, windowHours));
-}
+  // windowHours policy:
+  // - GLOBAL discovery: default 72h, allow up to 72h (or user-provided).
+  // - PROJECT strict: default 24h, but if a watchlist is present, allow up to 72h.
+  let windowHours = Number(watchlist?.windowHours || (STRICT_PROJECT_SCAN ? 24 : 72));
+  const maxWindow = STRICT_PROJECT_SCAN ? (hasWatchlist ? 72 : 24) : 72;
+  windowHours = Math.max(1, Math.min(maxWindow, windowHours));
 
 console.log("🕒 windowHours resolved:", {
   isGlobalProject,
@@ -909,7 +925,7 @@ console.log("🕒 windowHours resolved:", {
       try {
         const rssFeeds =
           STRICT_PROJECT_SCAN && NEWS_QUERIES.length
-            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 })
+            ? buildGoogleNewsRssFeeds(NEWS_QUERIES, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12, windowHours })
             : getRssFeedsForRegions(REGIONS);
 
         if (STRICT_PROJECT_SCAN && NEWS_QUERIES.length) {
@@ -1191,7 +1207,7 @@ console.log("🕒 windowHours resolved:", {
         const seeds = items.filter((it) => safePlatform(it.platform) === "youtube").slice(0, 10);
         const probeQueries = buildProbeQueriesFromItems(seeds, { limit: 10, addTikTok: true, addInstagram: true });
         if (probeQueries.length) {
-          const probeFeeds = buildGoogleNewsRssFeeds(probeQueries, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12 });
+          const probeFeeds = buildGoogleNewsRssFeeds(probeQueries, { hl: "en-US", gl: "US", ceid: "US:en", limit: 12, windowHours });
           console.log("🧲 Enriching news via Google News RSS (seeded):", { probes: probeQueries.length, feeds: probeFeeds.length });
 
           const extraRss = await collectRss({
@@ -1446,3 +1462,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
+
