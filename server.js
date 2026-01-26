@@ -696,7 +696,10 @@ app.post("/scan", requireAuth, async (req, res) => {
     platforms = ["youtube"],
     region = "Global",
     regions,
-    scanMode,
+	    // Optional: scan mode hint from Base44
+	    // - "GLOBAL" / "DISCOVERY" (default)
+	    // - "PROJECT_STRICT" for per-project Trend Scan button
+	    scanMode,
     // Optional: richer hints for news collectors (project keywords + niches)
     newsQueries,
     // Optional watchlist:
@@ -1354,7 +1357,20 @@ try {
     );
 
     const topics = Array.isArray(listResp?.topics) ? listResp.topics : [];
-    const missing = topics.filter((t) => !String(t.summary || "").trim());
+
+    // Base44 builder guarantees a non-empty summary by applying a deterministic fallback.
+    // We still want LLM backfill to improve those fallbacks, so treat them as "missing".
+    const isFallbackSummary = (s) => {
+      const x = String(s || "").trim();
+      if (!x) return true;
+      // Our deterministic fallback starts with this prefix.
+      if (x.toLowerCase().startsWith("trending topic across")) return true;
+      // Guard: extremely short summaries are usually placeholders.
+      if (x.length < 24) return true;
+      return false;
+    };
+
+    const missing = topics.filter((t) => isFallbackSummary(t.summary));
 
     // Backfill up to 30 per run to avoid long scans
     const toFill = missing.slice(0, 30);
@@ -1463,4 +1479,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
-
