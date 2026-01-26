@@ -4,9 +4,35 @@ function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
 
+function normalizeDateString(dt) {
+  if (!dt) return dt;
+  const s = String(dt);
+
+  // Already parseable (ISO, RFC2822, etc.)
+  const t0 = Date.parse(s);
+  if (!Number.isNaN(t0)) return s;
+
+  // Compact UTC: YYYYMMDDTHHMMSSZ -> YYYY-MM-DDTHH:MM:SSZ
+  const m = s.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (m) {
+    const [, Y, Mo, D, H, Mi, S] = m;
+    return `${Y}-${Mo}-${D}T${H}:${Mi}:${S}Z`;
+  }
+
+  // Compact date only: YYYYMMDD
+  const d = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (d) {
+    const [, Y, Mo, D] = d;
+    return `${Y}-${Mo}-${D}T00:00:00Z`;
+  }
+
+  return s;
+}
+
 function parseDateMs(dt) {
   if (!dt) return NaN;
-  const t = new Date(dt).getTime();
+  const norm = normalizeDateString(dt);
+  const t = new Date(norm).getTime();
   return Number.isNaN(t) ? NaN : t;
 }
 

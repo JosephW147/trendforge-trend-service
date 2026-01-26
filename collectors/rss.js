@@ -31,7 +31,9 @@ export async function collectRss({
   feeds = [],
   nicheName,
   maxPerFeed = 6,
-  timeoutMs = 7000,
+  // Some major feeds (CNN/NPR/etc.) can be slow or transiently blocked.
+  // Keep timeout generous to reduce AbortController-triggered failures.
+  timeoutMs = 30000,
 }) {
   const out = [];
 
@@ -53,7 +55,14 @@ export async function collectRss({
 
       try {
         const res = await fetchWithRetry(feedUrl, {
-          headers: { "User-Agent": "TrendForgeBot/1.0 (+https://trendforge.app)" },
+          // A few feeds reject empty/default UAs or require browser-like headers.
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; TrendForgeBot/1.0; +https://trendforge.app)",
+            "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+          },
           signal: controller.signal,
         });
         xml = await res.text();

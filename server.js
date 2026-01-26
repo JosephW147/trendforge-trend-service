@@ -214,6 +214,66 @@ function safePlatform(raw) {
   return String(raw || "unknown").toLowerCase().trim();
 }
 
+// Deterministic, no-API social mention inference from ANY item text (news or youtube).
+// Used to power UI badges (TikTok/IG/Reels/Shorts/X) without scraping.
+function detectSocialHintsFromText(text) {
+  const t = String(text || "").toLowerCase();
+  const hasTikTok = t.includes("tiktok") || t.includes("tiktok.com") || /\btt\b/.test(t);
+  const hasInstagram = t.includes("instagram") || t.includes("instagram.com") || /\big\b/.test(t);
+  const hasReels = t.includes("reels") || t.includes("insta reels") || t.includes("instagram reels");
+  const hasShorts = t.includes("youtube shorts") || /\bshorts\b/.test(t);
+  return {
+    tiktokMention: !!hasTikTok,
+    instagramMention: !!hasInstagram,
+    reelsMention: !!hasReels,
+    shortsMention: !!hasShorts,
+  };
+}
+
+// Platform-aware selection for the final STORE pool before ingest.
+// Goal: avoid "all YouTube" runs when YouTube dominates scores.
+function pickBalancedStoreItems(items, {
+  maxStore = 60,
+  caps = { youtube: 30, news: 30 },
+} = {}) {
+  const byPlat = items.reduce((acc, it) => {
+    const p = safePlatform(it?.platform);
+    (acc[p] ||= []).push(it);
+    return acc;
+  }, {});
+
+  // Items are already globally sorted by trendScore, but we still sort within each platform
+  // in case a caller changes ordering upstream.
+  for (const p of Object.keys(byPlat)) {
+    byPlat[p].sort((a, b) => (b?.trendScore ?? 0) - (a?.trendScore ?? 0));
+  }
+
+  const picked = [];
+  const pickFrom = (p, n) => {
+    const arr = byPlat[p] || [];
+    for (const it of arr) {
+      if (picked.length >= maxStore) break;
+      if (n <= 0) break;
+      picked.push(it);
+      n--;
+    }
+    return n; // remaining
+  };
+
+  let remYt = pickFrom("youtube", Math.max(0, caps.youtube ?? 0));
+  let remNews = pickFrom("news", Math.max(0, caps.news ?? 0));
+
+  // Fill remainder from whatever is available, preserving score order.
+  if (picked.length < maxStore) {
+    const remainder = items.filter((it) => !picked.includes(it));
+    picked.push(...remainder.slice(0, maxStore - picked.length));
+  }
+
+  // Ensure final list is score-sorted (composition stays balanced).
+  picked.sort((a, b) => (b?.trendScore ?? 0) - (a?.trendScore ?? 0));
+  return picked.slice(0, maxStore);
+}
+
 function safeUrlFrom(raw, normalized) {
   return (
     normalized.sourceUrl ||
@@ -861,8 +921,9 @@ console.log("🕒 windowHours resolved:", {
             feeds: rssFeeds.slice(0, 8),     // hard cap feeds
             nicheName: NEWS_QUERIES.join(" OR ") || nicheName,
             maxPerFeed: 4,                   // smaller per-feed pull
+            timeoutMs: 30_000,                // per-feed abort (some feeds are slow)
           }),
-          15_000,
+          35_000,
           "rss"
         );
       } catch (e) {
@@ -1081,6 +1142,15 @@ console.log("🕒 windowHours resolved:", {
     for (const it of items) {
       it.metrics = it.metrics || {};
 
+      // Ensure we have deterministic social hints for *all* items, not just RSS/news.
+      // (YouTube descriptions often contain IG/TikTok links; we want badges to show.)
+      const textForHints = `${it.topicTitle || it.title || ""} ${it.topicSummary || it.summary || ""}`;
+      const inferred = detectSocialHintsFromText(textForHints);
+      const existing = (it.metrics.socialHints && typeof it.metrics.socialHints === "object")
+        ? it.metrics.socialHints
+        : {};
+      it.metrics.socialHints = { ...inferred, ...existing };
+
       const social = it.metrics.socialHints || {};
       const hasX = !!it.metrics.xSignal?.ok;
 
@@ -1184,7 +1254,11 @@ console.log("🕒 windowHours resolved:", {
 
     // 7) STORE pool (important for Base44 topic building)
     const MAX_STORE = 60;
-    const storeItems = items.slice(0, MAX_STORE);
+    // Platform-aware balancing prevents "all YouTube" store pools when YouTube dominates scores.
+    // Applies when both platforms were requested.
+    const storeItems = (requested.includes("youtube") && requested.includes("news"))
+      ? pickBalancedStoreItems(items, { maxStore: MAX_STORE, caps: { youtube: 30, news: 30 } })
+      : items.slice(0, MAX_STORE);
 
     console.log("✅ STORE TrendItems count:", storeItems.length);
 
@@ -1227,6 +1301,8 @@ try {
   console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 
   // Build topics in Base44 (pure clustering/scoring, no LLM here)
+  // Base44 functions are protected by x-trendforge-secret (set in postJson/postToBase44* helpers).
+  // Do NOT require a separate Bearer token here.
   const topicsResp = await postJson(
     BASE44_BUILD_TOPICS_URL,
     {
@@ -1234,12 +1310,7 @@ try {
       projectId,
       maxTopics: 60,
     },
-    {
-      headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` },
-      retries: 7,
-      baseDelayMs: 900,
-      traceId,
-    }
+    { retries: 7, baseDelayMs: 900 }
   );
 
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
@@ -1262,7 +1333,7 @@ try {
     const listResp = await postJson(
       LIST_TOPICS_URL,
       { trendRunId, projectId },
-      { headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` }, retries: 3, baseDelayMs: 500, traceId }
+      { retries: 3, baseDelayMs: 500 }
     );
 
     const topics = Array.isArray(listResp?.topics) ? listResp.topics : [];
@@ -1329,7 +1400,7 @@ try {
         await postJson(
           UPDATE_TOPIC_URL,
           { topicId: t.id || t.topicId, summary, llmNotes: "LLM backfill (Render)" },
-          { headers: { Authorization: `Bearer ${BASE44_SERVICE_TOKEN}` }, retries: 3, baseDelayMs: 400, traceId }
+          { retries: 3, baseDelayMs: 400 }
         );
 
         updated++;
@@ -1375,4 +1446,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`TrendForge Trend Service running on port ${PORT}`);
 });
-
