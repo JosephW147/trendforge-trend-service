@@ -696,6 +696,7 @@ app.post("/scan", requireAuth, async (req, res) => {
     platforms = ["youtube"],
     region = "Global",
     regions,
+    scanMode,
     // Optional: richer hints for news collectors (project keywords + niches)
     newsQueries,
     // Optional watchlist:
