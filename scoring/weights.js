@@ -1,4 +1,4 @@
 export const PLATFORM_WEIGHTS = {
-  youtube: 1.0,
+  youtube: 0.9,
   news: 0.85,
 };

@@ -13,8 +13,6 @@ import { scoreItemsComparable } from "./scoring/score.js";
 import { fetchGoogleTrendsSignal } from "./collectors/googleTrends.js";
 import { fetchXTrends } from "./collectors/xTrends.js";
 import { buildEditorial } from "./editorial/buildEditorial.js";
-import { createClient } from "@base44/sdk";
-import { buildTrendSignalsForRun } from "./signals/buildTrendSignals.js";
 
 const app = express();
 app.use(cors());
@@ -31,6 +29,10 @@ function withDeadline(promise, ms, label = "deadline") {
 }
 
 // Base44 function to compute topics from TrendItems already stored for a TrendRun
+const BASE44_BUILD_SIGNALS_URL =
+  process.env.BASE44_BUILD_SIGNALS_URL ||
+  "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendSignalsFromRun";
+
 const BASE44_BUILD_TOPICS_URL =
   process.env.BASE44_BUILD_TOPICS_URL ||
   "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/buildTrendTopicsFromRun";
@@ -38,26 +40,6 @@ const BASE44_BUILD_TOPICS_URL =
 const BASE44_INGEST_URL =
   process.env.BASE44_INGEST_URL ||
   "https://trend-spark-485fdded.base44.app/api/apps/6953c58286976a82485fdded/functions/ingestTrendResults";
-
-// Optional: build TrendSignal rows directly via Base44 Entities API (bypasses Deno function redeploy issues)
-const BASE44_SERVICE_ROLE_TOKEN =
-  process.env.BASE44_SERVICE_ROLE_TOKEN || process.env.BASE44_SERVICE_TOKEN || "";
-
-function inferBase44AppId(url) {
-  try {
-    const m = String(url || "").match(/\/api\/apps\/([^/]+)/);
-    return m?.[1] || "";
-  } catch {
-    return "";
-  }
-}
-
-function getBase44Client() {
-  const appId = process.env.BASE44_APP_ID || inferBase44AppId(BASE44_INGEST_URL) || inferBase44AppId(BASE44_BUILD_TOPICS_URL);
-  if (!appId || !BASE44_SERVICE_ROLE_TOKEN) return null;
-  return createClient({ appId, serviceToken: BASE44_SERVICE_ROLE_TOKEN });
-}
-
 
 // ---- Env sanity ----
 if (!process.env.BASE44_INGEST_URL) console.warn("⚠️ BASE44_INGEST_URL is missing");
@@ -1473,45 +1455,17 @@ try {
   // This step bypasses Base44 Deno function redeploy issues by writing to the TrendSignal entity directly.
   // If you haven't created the TrendSignal entity yet, this will log a warning and skip.
   try {
-    const base44 = getBase44Client();
-    if (!base44) {
-      console.log("⚠️ TrendSignal build skipped: BASE44_SERVICE_ROLE_TOKEN or appId missing");
-    } else {
-      const { signals } = await buildTrendSignalsForRun({ base44, trendRunId, projectId });
+    console.log("SIGNALS build URL:", BASE44_BUILD_SIGNALS_URL);
 
-      // Delete existing signals for this run, then create fresh (idempotent-ish)
-      let deleted = 0;
-      try {
-        const existing = await base44.asServiceRole.entities.TrendSignal.filter(
-          { trendRunId, projectId },
-          "-created_date",
-          500
-        );
-        const existingItems = existing?.items ?? existing ?? [];
-        for (const s of existingItems) {
-          const id = s.id || s._id;
-          if (!id) continue;
-          await base44.asServiceRole.entities.TrendSignal.delete(id);
-          deleted++;
-        }
-      } catch (e) {
-        console.log("⚠️ TrendSignal delete step skipped (entity may not exist yet):", e?.message || e);
-      }
+    // Keep payload minimal + deterministic.
+    // Base44 function should resolve projectId from TrendRunId internally.
+    const signalsResp = await postJson(
+      BASE44_BUILD_SIGNALS_URL,
+      { trendRunId },
+      { retries: 5, baseDelayMs: 900, maxDelayMs: 12_000 }
+    );
 
-      let createdSignals = 0;
-      for (const s of signals) {
-        try {
-          await base44.asServiceRole.entities.TrendSignal.create(s);
-          createdSignals++;
-        } catch (e) {
-          // If entity doesn't exist yet, this will throw; do not fail the run.
-          console.log("⚠️ TrendSignal create failed:", e?.message || e);
-          break;
-        }
-      }
-
-      console.log("✅ TrendSignal build:", { deleted, created: createdSignals, computed: signals.length });
-    }
+    console.log("✅ Base44 buildTrendSignalsFromRun response:", signalsResp);
   } catch (e) {
     console.log("⚠️ TrendSignal build step failed (non-fatal):", e?.message || e);
   }
