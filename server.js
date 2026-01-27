@@ -122,101 +122,32 @@ async function postToBase44(url, payload) {
     return text;
   }
 }
-// ---- Base44 POST helper with backoff -----
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// ---- Base44 helpers (NO retries/backoff) -----
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Simple JSON POST helper (no retry/backoff)
+async function postJson(url, payload) {
+  return postToBase44(url, payload);
 }
 
-// Retry ONLY when Base44 says rate-limited
-async function postToBase44WithBackoff(url, payload, opts = {}) {
-  const {
-    retries = 7,
-    baseDelayMs = 800,
-    maxDelayMs = 12_000,
-  } = opts;
-
-  let lastErr;
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
+// Wait until TrendTopics are visible for this run (Base44 can be eventually consistent).
+async function waitForTopics({ trendRunId, projectId, base44FunctionsBase }) {
+  const listUrl = `${base44FunctionsBase}/listTrendTopicsByRun`;
+  for (let attempt = 1; attempt <= 6; attempt++) {
     try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-trendforge-secret": INGEST_SECRET,
-        },
-        body: JSON.stringify(deepCleanForUtf8(payload)),
-      });
-
-      const text = await resp.text();
-
-      const isRateLimited =
-        resp.status === 429 ||
-        text.toLowerCase().includes("rate limit");
-
-      if (resp.ok) {
-        try {
-          return JSON.parse(text);
-        } catch {
-          return text;
-        }
+      const resp = await postToBase44(listUrl, { trendRunId, projectId });
+      const topics = Array.isArray(resp?.topics) ? resp.topics : (Array.isArray(resp?.items) ? resp.items : []);
+      if (Array.isArray(topics) && topics.length > 0) {
+        console.log("✅ waitForTopics: topics visible", { count: topics.length, attempt });
+        return topics;
       }
-
-      if (isRateLimited && attempt < retries) {
-        const jitter = Math.floor(Math.random() * 250);
-        const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt)) + jitter;
-        console.log(`⏳ Base44 rate-limited. Retry in ${delay}ms (attempt ${attempt + 1}/${retries})`);
-        await sleep(delay);
-        continue;
-      }
-
-      // Non-rate-limit error or out of retries
-      throw new Error(`Base44 call failed ${resp.status}: ${text}`);
+      console.log("⏳ waitForTopics: no topics yet", { attempt });
     } catch (e) {
-      lastErr = e;
-      // Retry network errors too (rare)
-      if (attempt < retries) {
-        const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
-        console.log(`⏳ Base44 network/error retry in ${delay}ms (attempt ${attempt + 1}/${retries})`);
-        await sleep(delay);
-        continue;
-      }
-      break;
+      console.log("⚠️ waitForTopics error (continuing):", e?.message || e);
     }
+    await sleep(800);
   }
-
-  throw lastErr || new Error("Base44 call failed (unknown)");
-}
-
-// Simple JSON POST helper used by some callers (alias of postToBase44WithBackoff).
-// Keeps older code paths working if they call postJson().
-async function postJson(url, payload, opts = {}) {
-  return postToBase44WithBackoff(url, payload, opts);
-}
-
-
-function functionBaseFrom(anyFunctionUrl) {
-  // "....../functions/<name>" -> "....../functions"
-  const u = String(anyFunctionUrl || "");
-  const i = u.indexOf("/functions/");
-  if (i === -1) return u;
-  return u.slice(0, i + "/functions".length);
-}
-
-async function waitForTopics({ trendRunId, projectId, baseUrl, attempts = 6, delayMs = 900 }) {
-  // Poll Base44 until TrendTopics are queryable (avoids eventual-consistency race)
-  const LIST_TOPICS_URL = `${baseUrl}/listTrendTopicsByRun`;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const resp = await postJson(LIST_TOPICS_URL, { trendRunId, projectId }, { retries: 2, baseDelayMs: 400 });
-      const topics = Array.isArray(resp?.topics) ? resp.topics : [];
-      if (topics.length > 0) return { ok: true, count: topics.length };
-    } catch (e) {
-      // ignore and retry
-    }
-    await sleep(delayMs);
-  }
-  return { ok: false, count: 0 };
+  return [];
 }
 
 // ✅ Normalize requested platforms (treat legacy socials as "news" if they appear)
@@ -1315,20 +1246,19 @@ console.log("🕒 windowHours resolved:", {
 
     let ingestResp;
     try {
-      ingestResp = await postToBase44WithBackoff(
-        process.env.BASE44_INGEST_URL,
+      ingestResp = await postToBase44(
+        BASE44_INGEST_URL,
         {
           trendRunId,
           projectId,
           items: storeItems,
           ...(xSignalSnapshot ? { xSignalSnapshot } : {}),
-        },
-        { retries: 8, baseDelayMs: 900, maxDelayMs: 15_000 }
+                }
       );
       console.log("✅ Base44 TrendItems ingest response:", ingestResp);
 
-      // Give Base44 a brief breather after a large ingest to reduce throttling
-      await sleep(1200);
+      // Small breather after ingest
+      await sleep(800);
     } catch (e) {
       // If Base44 is down/flaky, fail gracefully and mark the run error
       throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
@@ -1349,17 +1279,16 @@ try {
   console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 
   // Build topics in Base44 (pure clustering/scoring, no LLM here)
-  const topicsResp = await postJson(
+  const topicsResp = await postToBase44(
     BASE44_BUILD_TOPICS_URL,
-    {
-      trendRunId,
-      projectId,
-      maxTopics: 60,
-    },
-    { retries: 7, baseDelayMs: 900 }
+    { trendRunId, projectId, maxTopics: 60 }
   );
 
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
+
+  // Ensure topics are queryable before downstream steps
+  const base44FunctionsBase = BASE44_BUILD_TOPICS_URL.split("/functions/")[0] + "/functions";
+  const visibleTopics = await waitForTopics({ trendRunId, projectId, base44FunctionsBase });
 
   // ---- LLM summary backfill (Render backend -> OpenAI -> Base44 update) ----
   const SUMMARY_LLM_ENABLED = String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false";
@@ -1367,7 +1296,7 @@ try {
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
   if (SUMMARY_LLM_ENABLED && OPENAI_API_KEY) {
-    const base44Base = BASE44_BUILD_TOPICS_URL.split("/functions/")[0] + "/functions";
+    const base44Base = base44FunctionsBase;
     const LIST_TOPICS_URL = `${base44Base}/listTrendTopicsByRun`;
     const UPDATE_TOPIC_URL = `${base44Base}/updateTrendTopicSummary`;
 
@@ -1375,11 +1304,7 @@ try {
       try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; }
     };
 
-    const listResp = await postJson(
-      LIST_TOPICS_URL,
-      { trendRunId, projectId },
-      { retries: 3, baseDelayMs: 500 }
-    );
+    const listResp = await postToBase44(LIST_TOPICS_URL, { trendRunId, projectId });
 
     const topics = Array.isArray(listResp?.topics) ? listResp.topics : [];
 
@@ -1455,11 +1380,7 @@ try {
         const summary = await summarizeOne(t);
         if (!summary) { skipped++; continue; }
 
-        await postJson(
-          UPDATE_TOPIC_URL,
-          { topicId: t.id || t.topicId, summary, llmNotes: "LLM backfill (Render)" },
-          { retries: 3, baseDelayMs: 400 }
-        );
+        await postToBase44(UPDATE_TOPIC_URL, { topicId: t.id || t.topicId, summary, llmNotes: "LLM backfill (Render)" });
 
         updated++;
       } catch (e) {
@@ -1481,10 +1402,9 @@ try {
 
     // Keep payload minimal + deterministic.
     // Base44 function should resolve projectId from TrendRunId internally.
-    const signalsResp = await postJson(
+    const signalsResp = await postToBase44(
       BASE44_BUILD_SIGNALS_URL,
-      { trendRunId, projectId },
-      { retries: 5, baseDelayMs: 900, maxDelayMs: 12_000 }
+      { trendRunId, projectId }
     );
 
     console.log("✅ Base44 buildTrendSignalsFromRun response:", signalsResp);
