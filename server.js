@@ -1324,8 +1324,6 @@ try {
   console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 
   // Build topics in Base44 (pure clustering/scoring, no LLM here)
-  // Base44 functions are protected by x-trendforge-secret (set in postJson/postToBase44* helpers).
-  // Do NOT require a separate Bearer token here.
   const topicsResp = await postJson(
     BASE44_BUILD_TOPICS_URL,
     {
@@ -1339,7 +1337,6 @@ try {
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
 
   // ---- LLM summary backfill (Render backend -> OpenAI -> Base44 update) ----
-  // We do this here (in Render) so the same logic works when you later migrate away from Base44.
   const SUMMARY_LLM_ENABLED = String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false";
   const SUMMARY_LLM_MODEL = process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini";
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -1392,11 +1389,11 @@ try {
         `Write a concise 1–2 sentence news-style summary for a trending topic. ` +
         `Do not use hashtags. Do not include links. Be factual and neutral. ` +
         `Title: ${title}
-` +
+        ` +
         (keywords ? `Keywords: ${keywords}
-` : "") +
+        ` : "") +
         (platforms ? `Platforms: ${platforms}
-` : "");
+        ` : "");
 
       const resp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
