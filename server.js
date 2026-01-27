@@ -194,6 +194,31 @@ async function postJson(url, payload, opts = {}) {
   return postToBase44WithBackoff(url, payload, opts);
 }
 
+
+function functionBaseFrom(anyFunctionUrl) {
+  // "....../functions/<name>" -> "....../functions"
+  const u = String(anyFunctionUrl || "");
+  const i = u.indexOf("/functions/");
+  if (i === -1) return u;
+  return u.slice(0, i + "/functions".length);
+}
+
+async function waitForTopics({ trendRunId, projectId, baseUrl, attempts = 6, delayMs = 900 }) {
+  // Poll Base44 until TrendTopics are queryable (avoids eventual-consistency race)
+  const LIST_TOPICS_URL = `${baseUrl}/listTrendTopicsByRun`;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const resp = await postJson(LIST_TOPICS_URL, { trendRunId, projectId }, { retries: 2, baseDelayMs: 400 });
+      const topics = Array.isArray(resp?.topics) ? resp.topics : [];
+      if (topics.length > 0) return { ok: true, count: topics.length };
+    } catch (e) {
+      // ignore and retry
+    }
+    await sleep(delayMs);
+  }
+  return { ok: false, count: 0 };
+}
+
 // ✅ Normalize requested platforms (treat legacy socials as "news" if they appear)
 function normalizeRequestedPlatforms(input = []) {
   const set = new Set((input || []).map((p) => String(p).toLowerCase().trim()));
@@ -1285,95 +1310,94 @@ console.log("🕒 windowHours resolved:", {
 
     console.log("✅ STORE TrendItems count:", storeItems.length);
 
-    
-// 8) Ingest TrendItems (STORE pool)  ✅ MUST RUN FIRST
-console.log("➡️ Calling Base44 TrendItems ingest:", BASE44_INGEST_URL);
+    // 8) Ingest TrendItems (STORE pool)
+    console.log("➡️ Calling Base44 TrendItems ingest:", process.env.BASE44_INGEST_URL);
 
-let ingestResp;
+    let ingestResp;
+    try {
+      ingestResp = await postToBase44WithBackoff(
+        process.env.BASE44_INGEST_URL,
+        {
+          trendRunId,
+          projectId,
+          items: storeItems,
+          ...(xSignalSnapshot ? { xSignalSnapshot } : {}),
+        },
+        { retries: 8, baseDelayMs: 900, maxDelayMs: 15_000 }
+      );
+      console.log("✅ Base44 TrendItems ingest response:", ingestResp);
+
+      // Give Base44 a brief breather after a large ingest to reduce throttling
+      await sleep(1200);
+    } catch (e) {
+      // If Base44 is down/flaky, fail gracefully and mark the run error
+      throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
+    }
+
+
+
+    const storeCounts = storeItems.reduce((a, it) => {
+      const p = safePlatform(it.platform);
+      a[p] = (a[p] || 0) + 1;
+      return a;
+    }, {});
+    console.log("📦 STORE platformCounts:", storeCounts);
+
+    // 9) Build TrendTopics in Base44 from stored TrendItems
+    console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
 try {
-  ingestResp = await postToBase44WithBackoff(
-    BASE44_INGEST_URL,
+  console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
+
+  // Build topics in Base44 (pure clustering/scoring, no LLM here)
+  const topicsResp = await postJson(
+    BASE44_BUILD_TOPICS_URL,
     {
       trendRunId,
       projectId,
-      items: storeItems,
-      ...(xSignalSnapshot ? { xSignalSnapshot } : {}),
+      maxTopics: 60,
     },
-    { retries: 8, baseDelayMs: 900, maxDelayMs: 15_000 }
+    { retries: 7, baseDelayMs: 900 }
   );
-  console.log("✅ Base44 TrendItems ingest response:", ingestResp);
 
-  // Give Base44 a brief breather after a large ingest to reduce throttling
-  await sleep(1200);
-} catch (e) {
-  throw new Error(`Base44 ingestTrendResults failed: ${e?.message || e}`);
-}
-
-const storeCounts = storeItems.reduce((a, it) => {
-  const p = safePlatform(it.platform);
-  a[p] = (a[p] || 0) + 1;
-  return a;
-}, {});
-console.log("📦 STORE platformCounts:", storeCounts);
-
-// 9) Build TrendTopics ✅ MUST RUN SECOND (after ingest)
-console.log("TOPICS build URL:", BASE44_BUILD_TOPICS_URL);
-
-let topicsResp = null;
-try {
-  topicsResp = await postJson(
-    BASE44_BUILD_TOPICS_URL,
-    { trendRunId, projectId, maxTopics: 60 },
-    { retries: 7, baseDelayMs: 900, maxDelayMs: 12_000 }
-  );
   console.log("✅ Base44 buildTrendTopicsFromRun response:", topicsResp);
 
-  // Allow Base44 writes/indexing to settle before dependent reads
-  await sleep(1200);
-} catch (e) {
-  console.error("❌ Base44 buildTrendTopicsFromRun failed:", e?.message || e);
-  // Topics are required for both summary backfill and signals.
-  // Do NOT attempt dependent steps if topics build failed.
-  return;
-}
+  // ---- LLM summary backfill (Render backend -> OpenAI -> Base44 update) ----
+  const SUMMARY_LLM_ENABLED = String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false";
+  const SUMMARY_LLM_MODEL = process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini";
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-// 10) Optional summary backfill ✅ MUST RUN AFTER TOPICS
-const SUMMARY_LLM_ENABLED = String(process.env.SUMMARY_LLM_ENABLED || "true") !== "false";
-const SUMMARY_LLM_MODEL = process.env.SUMMARY_LLM_MODEL || "gpt-4o-mini";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-
-try {
   if (SUMMARY_LLM_ENABLED && OPENAI_API_KEY) {
     const base44Base = BASE44_BUILD_TOPICS_URL.split("/functions/")[0] + "/functions";
     const LIST_TOPICS_URL = `${base44Base}/listTrendTopicsByRun`;
     const UPDATE_TOPIC_URL = `${base44Base}/updateTrendTopicSummary`;
 
     const safeJsonArray = (s) => {
-      try {
-        const a = JSON.parse(s || "[]");
-        return Array.isArray(a) ? a : [];
-      } catch {
-        return [];
-      }
+      try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; }
     };
 
     const listResp = await postJson(
       LIST_TOPICS_URL,
       { trendRunId, projectId },
-      { retries: 3, baseDelayMs: 500, maxDelayMs: 6_000 }
+      { retries: 3, baseDelayMs: 500 }
     );
 
     const topics = Array.isArray(listResp?.topics) ? listResp.topics : [];
 
+    // Base44 builder guarantees a non-empty summary by applying a deterministic fallback.
+    // We still want LLM backfill to improve those fallbacks, so treat them as "missing".
     const isFallbackSummary = (s) => {
       const x = String(s || "").trim();
       if (!x) return true;
+      // Our deterministic fallback starts with this prefix.
       if (x.toLowerCase().startsWith("trending topic across")) return true;
+      // Guard: extremely short summaries are usually placeholders.
       if (x.length < 24) return true;
       return false;
     };
 
     const missing = topics.filter((t) => isFallbackSummary(t.summary));
+
+    // Backfill up to 30 per run to avoid long scans
     const toFill = missing.slice(0, 30);
 
     const summarizeOne = async (t) => {
@@ -1383,17 +1407,18 @@ try {
         try {
           const c = JSON.parse(t.platformCountsJson || "{}");
           return Object.keys(c).filter((k) => c[k] > 0).join(", ");
-        } catch {
-          return "";
-        }
+        } catch { return ""; }
       })();
 
       const prompt =
         `Write a concise 1–2 sentence news-style summary for a trending topic. ` +
         `Do not use hashtags. Do not include links. Be factual and neutral. ` +
-        `Title: ${title}\n` +
-        (keywords ? `Keywords: ${keywords}\n` : "") +
-        (platforms ? `Platforms: ${platforms}\n` : "");
+        `Title: ${title}
+        ` +
+        (keywords ? `Keywords: ${keywords}
+        ` : "") +
+        (platforms ? `Platforms: ${platforms}
+        ` : "");
 
       const resp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -1416,7 +1441,8 @@ try {
         throw new Error(`OpenAI summary failed ${resp.status}: ${errText}`);
       }
       const data = await resp.json();
-      return String(data?.choices?.[0]?.message?.content || "").trim();
+      const summary = String(data?.choices?.[0]?.message?.content || "").trim();
+      return summary;
     };
 
     let attempted = 0;
@@ -1427,15 +1453,12 @@ try {
       attempted++;
       try {
         const summary = await summarizeOne(t);
-        if (!summary) {
-          skipped++;
-          continue;
-        }
+        if (!summary) { skipped++; continue; }
 
         await postJson(
           UPDATE_TOPIC_URL,
           { topicId: t.id || t.topicId, summary, llmNotes: "LLM backfill (Render)" },
-          { retries: 3, baseDelayMs: 400, maxDelayMs: 6_000 }
+          { retries: 3, baseDelayMs: 400 }
         );
 
         updated++;
@@ -1449,26 +1472,32 @@ try {
   } else {
     console.log("🧠 Topic summary backfill skipped:", { SUMMARY_LLM_ENABLED, hasKey: Boolean(OPENAI_API_KEY) });
   }
+
+  // ---- TrendSignal build (UI card projection) ----
+  // This step bypasses Base44 Deno function redeploy issues by writing to the TrendSignal entity directly.
+  // If you haven't created the TrendSignal entity yet, this will log a warning and skip.
+  try {
+    console.log("SIGNALS build URL:", BASE44_BUILD_SIGNALS_URL);
+
+    // Keep payload minimal + deterministic.
+    // Base44 function should resolve projectId from TrendRunId internally.
+    const signalsResp = await postJson(
+      BASE44_BUILD_SIGNALS_URL,
+      { trendRunId, projectId },
+      { retries: 5, baseDelayMs: 900, maxDelayMs: 12_000 }
+    );
+
+    console.log("✅ Base44 buildTrendSignalsFromRun response:", signalsResp);
+  } catch (e) {
+    console.log("⚠️ TrendSignal build step failed (non-fatal):", e?.message || e);
+  }
 } catch (e) {
-  console.warn("⚠️ Topic summary backfill block failed (continuing):", e?.message || e);
+  console.error("❌ Base44 buildTrendTopicsFromRun failed (after retries):", e?.message || e);
+
+  // Optional: mark a warning somewhere (do not fail entire run)
+  // You could call BASE44_ERROR_URL with a non-fatal warning if you want
 }
-
-// 11) Build TrendSignals ✅ MUST RUN LAST (after topics + optional summaries)
-try {
-  console.log("SIGNALS build URL:", BASE44_BUILD_SIGNALS_URL);
-
-  const signalsResp = await postJson(
-    BASE44_BUILD_SIGNALS_URL,
-    { trendRunId, projectId },
-    { retries: 5, baseDelayMs: 900, maxDelayMs: 12_000 }
-  );
-
-  console.log("✅ Base44 buildTrendSignalsFromRun response:", signalsResp);
-} catch (e) {
-  console.log("⚠️ TrendSignal build step failed (non-fatal):", e?.message || e);
-}
-
-} catch (err) {
+ } catch (err) {
     console.error("❌ Scan pipeline failed:", err?.message || err);
 
     // Best-effort error callback to Base44
