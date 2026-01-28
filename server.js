@@ -1464,6 +1464,157 @@ try {
   } catch (e) {
     console.log("⚠️ TrendSignal build step failed (non-fatal):", e?.message || e);
   }
+  // ---- LLM angles backfill for TrendSignals (Render backend -> OpenAI -> Base44 update) ----
+  const ANGLES_LLM_ENABLED = String(process.env.ANGLES_LLM_ENABLED || "true") !== "false";
+  const ANGLES_LLM_MODEL = process.env.ANGLES_LLM_MODEL || "gpt-4o-mini";
+  // reuse OPENAI_API_KEY from above (already in your file)
+
+  if (ANGLES_LLM_ENABLED && OPENAI_API_KEY) {
+    try {
+      const base44Base = base44FunctionsBase; // already computed earlier
+      const LIST_SIGNALS_URL = `${base44Base}/listTrendSignalsByRun`;
+      const UPDATE_SIGNAL_URL = `${base44Base}/updateTrendSignalAngles`;
+
+      const safeJson = (s, fallback) => {
+        try {
+          const x = JSON.parse(s || "");
+          return x ?? fallback;
+        } catch {
+          return fallback;
+        }
+      };
+
+      const hasAngles = (sig) => {
+        const status = String(sig?.llmAnglesStatus || "").toLowerCase().trim();
+        if (status && status !== "empty") {
+          const arr = safeJson(sig?.llmAnglesJson, []);
+          return Array.isArray(arr) && arr.length > 0;
+        }
+        const arr = safeJson(sig?.llmAnglesJson, []);
+        return Array.isArray(arr) && arr.length > 0;
+      };
+
+      const listResp = await postToBase44(LIST_SIGNALS_URL, {
+        trendRunId,
+        projectId,
+        limit: 80,
+        sort: "-scoreComposite",
+      });
+
+      const signals = Array.isArray(listResp?.signals) ? listResp.signals : [];
+      const missing = signals.filter((s) => !hasAngles(s));
+
+      // Keep it bounded so scan doesn’t get slow/expensive
+      const toFill = missing.slice(0, 30);
+
+      const buildEvidenceLines = (sig) => {
+        const ev = safeJson(sig?.evidenceJson, {});
+        const yt = Array.isArray(ev?.youtubeTop) ? ev.youtubeTop : [];
+        const news = Array.isArray(ev?.newsTop) ? ev.newsTop : [];
+
+        const topYtTitles = yt.slice(0, 3).map((x) => String(x?.title || "").trim()).filter(Boolean);
+        const topNewsTitles = news.slice(0, 3).map((x) => String(x?.title || "").trim()).filter(Boolean);
+
+        let out = "";
+        if (topYtTitles.length) out += `Top YouTube evidence: ${topYtTitles.join(" | ")}\n`;
+        if (topNewsTitles.length) out += `Top News evidence: ${topNewsTitles.join(" | ")}\n`;
+        return out.trim();
+      };
+
+      const generateAnglesOne = async (sig) => {
+        const title = String(sig?.canonicalTitle || "").slice(0, 200);
+        const summary = String(sig?.summary || "").slice(0, 420);
+        const evidenceLines = buildEvidenceLines(sig);
+
+        const prompt =
+          `You are generating “Suggested Angles” for a trend card.\n` +
+          `Return ONLY a JSON array of 3 to 5 short angle ideas.\n` +
+          `Rules:\n` +
+          `- Each angle is 4–9 words.\n` +
+          `- No hashtags. No emojis. No quotes.\n` +
+          `- Must be distinct.\n` +
+          `- Keep each under ~60 characters.\n\n` +
+          `Title: ${title}\n` +
+          (summary ? `Summary: ${summary}\n` : "") +
+          (evidenceLines ? `${evidenceLines}\n` : "");
+
+        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: ANGLES_LLM_MODEL,
+            temperature: 0.5,
+            messages: [
+              { role: "system", content: "You output strict JSON only." },
+              { role: "user", content: prompt },
+            ],
+          }),
+        });
+
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => "");
+          throw new Error(`OpenAI angles failed ${resp.status}: ${errText}`);
+        }
+
+        const data = await resp.json();
+        const raw = String(data?.choices?.[0]?.message?.content || "").trim();
+
+        // Parse strict JSON array
+        let arr = [];
+        try {
+          arr = JSON.parse(raw);
+        } catch {
+          // If model returned extra text, attempt to salvage first JSON array
+          const m = raw.match(/\[[\s\S]*\]/);
+          if (m) {
+            try { arr = JSON.parse(m[0]); } catch {}
+          }
+        }
+
+        // sanitize
+        if (!Array.isArray(arr)) arr = [];
+        arr = arr
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 5);
+
+        return arr;
+      };
+
+      let attempted = 0;
+      let updated = 0;
+      let skipped = 0;
+
+      for (const sig of toFill) {
+        attempted++;
+        try {
+          const angles = await generateAnglesOne(sig);
+          if (!angles.length) { skipped++; continue; }
+
+          await postToBase44(UPDATE_SIGNAL_URL, {
+            id: sig.id,
+            angles, // update function accepts "angles" or "llmAnglesJson"
+            llmAnglesStatus: "generated",
+          });
+
+          updated++;
+        } catch (e) {
+          console.warn("⚠️ signal angles backfill failed:", e?.message || e);
+          skipped++;
+        }
+      }
+
+      console.log("🧠 Signal angles backfill:", { attempted, updated, skipped });
+    } catch (e) {
+      console.warn("🧠 Signal angles backfill block failed:", e?.message || e);
+    }
+  } else {
+    console.log("🧠 Signal angles backfill skipped:", { ANGLES_LLM_ENABLED, hasKey: Boolean(OPENAI_API_KEY) });
+  }
+
 } catch (e) {
   console.error("❌ Base44 buildTrendTopicsFromRun failed (after retries):", e?.message || e);
 
