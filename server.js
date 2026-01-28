@@ -639,6 +639,59 @@ app.post("/editorial", requireAuth, async (req, res) => {
   }
 });
 
+// ---- Admin: Rebuild topics + signals WITHOUT scan ----
+// This does NOT hit YouTube, RSS, GDELT, etc.
+// It only recomputes from existing TrendItems in Base44.
+app.post("/admin/rebuild-signals", requireAuth, async (req, res) => {
+  const { trendRunId, projectId } = req.body || {};
+
+  if (!trendRunId) {
+    return res.status(400).json({ error: "Missing trendRunId" });
+  }
+  if (!projectId) {
+    return res.status(400).json({ error: "Missing projectId" });
+  }
+
+  try {
+    console.log("🔁 Admin rebuild requested", { trendRunId, projectId });
+
+    // 1️⃣ Rebuild TrendTopics (freshness, clustering, aggregation)
+    console.log("➡️ Rebuilding TrendTopics");
+    const topicsResp = await postToBase44(
+      BASE44_BUILD_TOPICS_URL,
+      { trendRunId, projectId, maxTopics: 60 }
+    );
+
+    console.log("✅ TrendTopics rebuilt:", topicsResp);
+
+    // Small wait for Base44 eventual consistency
+    await sleep(800);
+
+    // 2️⃣ Rebuild TrendSignals (scores, cards, badges)
+    console.log("➡️ Rebuilding TrendSignals");
+    const signalsResp = await postToBase44(
+      BASE44_BUILD_SIGNALS_URL,
+      { trendRunId, projectId }
+    );
+
+    console.log("✅ TrendSignals rebuilt:", signalsResp);
+
+    return res.json({
+      ok: true,
+      trendRunId,
+      projectId,
+      topics: topicsResp,
+      signals: signalsResp,
+    });
+  } catch (err) {
+    console.error("❌ Admin rebuild failed:", err?.message || err);
+    return res.status(500).json({
+      error: "Rebuild failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
 // ---- Scan ----
 app.post("/scan", requireAuth, async (req, res) => {
   console.log("🔥🔥🔥 /scan HIT (TOP)", new Date().toISOString());
